@@ -1,7 +1,7 @@
 <div align="center">
 
 <p align="center">
-  <img src="assets/bear-logo.png" width="200" alt="BEAR logo">
+  <img src="assets/bear-logo.png" width="400" alt="BEAR logo">
 </p>
 
 # BEAR v1.0
