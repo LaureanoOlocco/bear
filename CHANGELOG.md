@@ -2,6 +2,14 @@
 
 All notable changes to BEAR will be documented in this file.
 
+## [1.1.1] - 2026-01-19
+
+### Added
+- Version display in server banner
+
+### Changed
+- Improved Ghidra endpoint with JSON body validation
+
 ## [1.1.0] - 2026-01-17
 
 ### Added

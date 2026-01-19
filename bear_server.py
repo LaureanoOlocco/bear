@@ -76,6 +76,7 @@ app.config['JSON_SORT_KEYS'] = False
 API_PORT = int(os.environ.get('BEAR_PORT', 8888))
 API_HOST = os.environ.get('BEAR_HOST', '127.0.0.1')
 DEBUG_MODE = False
+VERSION = "1.1.1"
 
 # Command execution settings
 COMMAND_TIMEOUT = int(os.environ.get('BEAR_TIMEOUT', 300))
@@ -128,8 +129,8 @@ class ModernVisualEngine:
 ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
 {RESET}
 {accent}┌─────────────────────────────────────────────────────────────────────────────┐
-│  {ModernVisualEngine.COLORS['BRIGHT_WHITE']}Binary Exploitation & Automated Reversing{accent}                                │
-│  {ModernVisualEngine.COLORS['CYBER_ORANGE']}Debuggers | Disassemblers | Exploit Development{accent}                         │
+│  {ModernVisualEngine.COLORS['BRIGHT_WHITE']}Binary Exploitation & Automated Reversing{accent}                 v{VERSION}           │
+│  {ModernVisualEngine.COLORS['CYBER_ORANGE']}Debuggers | Disassemblers | Exploit Development{accent}                            │
 └─────────────────────────────────────────────────────────────────────────────┘{RESET}
 """
 
@@ -688,7 +689,7 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "message": "BEAR - Binary Exploitation & Automated Reversing Server is operational",
-        "version": "1.0.0",
+        "version": VERSION,
         "tools_status": tools_status,
         "total_tools_available": available_count,
         "total_tools_count": len(binary_tools),
@@ -1092,6 +1093,9 @@ def ghidra_decompile():
     """Decompile binary using Ghidra headless mode with custom script"""
     try:
         params = request.json
+        if not params:
+            return jsonify({"error": "Request body must be JSON with Content-Type: application/json"}), 400
+
         binary = params.get("binary", "")
         function_name = params.get("function", "all")
         analysis_timeout = params.get("timeout", 300)
