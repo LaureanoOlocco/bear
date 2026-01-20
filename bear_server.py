@@ -53,7 +53,8 @@ import psutil
 try:
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
         handlers=[
             logging.StreamHandler(sys.stdout),
             logging.FileHandler('bear.log')
@@ -62,11 +63,13 @@ try:
 except PermissionError:
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 
 logger = logging.getLogger(__name__)
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 # Flask app configuration
 app = Flask(__name__)
@@ -76,7 +79,7 @@ app.config['JSON_SORT_KEYS'] = False
 API_PORT = int(os.environ.get('BEAR_PORT', 8888))
 API_HOST = os.environ.get('BEAR_HOST', '127.0.0.1')
 DEBUG_MODE = False
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 # Command execution settings
 COMMAND_TIMEOUT = int(os.environ.get('BEAR_TIMEOUT', 300))
@@ -369,9 +372,10 @@ class ProcessManager:
 class EnhancedCommandExecutor:
     """Enhanced command executor with progress tracking"""
 
-    def __init__(self, command: str, timeout: int = COMMAND_TIMEOUT):
+    def __init__(self, command: str, timeout: int = COMMAND_TIMEOUT, log_as: str = ""):
         self.command = command
         self.timeout = timeout
+        self.log_as = log_as
         self.process = None
         self.stdout_data = ""
         self.stderr_data = ""
@@ -397,7 +401,8 @@ class EnhancedCommandExecutor:
 
     def execute(self) -> Dict[str, Any]:
         self.start_time = time.time()
-        logger.info(f"Executing: {self.command}")
+        log_msg = self.log_as if self.log_as else self.command
+        logger.info(f"Executing: {log_msg}")
 
         try:
             self.process = subprocess.Popen(
@@ -471,14 +476,14 @@ class EnhancedCommandExecutor:
             }
 
 
-def execute_command(command: str, use_cache: bool = True, timeout: int = COMMAND_TIMEOUT) -> Dict[str, Any]:
+def execute_command(command: str, use_cache: bool = True, timeout: int = COMMAND_TIMEOUT, log_as: str = "") -> Dict[str, Any]:
     """Execute a shell command with caching support"""
     if use_cache:
         cached_result = cache.get(command, {})
         if cached_result:
             return cached_result
 
-    executor = EnhancedCommandExecutor(command, timeout)
+    executor = EnhancedCommandExecutor(command, timeout, log_as)
     result = executor.execute()
 
     if use_cache and result.get("success", False):
@@ -945,7 +950,7 @@ def gdb():
             command += f" {additional_args}"
         command += " -batch"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"GDB {binary}")
 
         if commands and os.path.exists("/tmp/gdb_commands.txt"):
             try:
@@ -992,7 +997,7 @@ def gdb_peda():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"GDB-PEDA {binary or core_file or f'PID:{attach_pid}'}")
 
         if commands and os.path.exists("/tmp/gdb_peda_commands.txt"):
             try:
@@ -1039,7 +1044,7 @@ def gdb_gef():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"GDB-GEF {binary or core_file or f'PID:{attach_pid}'}")
 
         if commands and os.path.exists("/tmp/gdb_gef_commands.txt"):
             try:
@@ -1075,7 +1080,7 @@ def radare2():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Radare2 {binary}")
 
         if commands and os.path.exists("/tmp/r2_commands.txt"):
             try:
@@ -1124,7 +1129,7 @@ def ghidra_decompile():
         # Build the command
         command = f'"{ghidra_headless}" "{project_dir}" decompile_project -import "{binary}" -scriptPath "{script_dir}" -postScript {decompile_script} "{function_name}" -deleteProject'
 
-        result = execute_command(command, timeout=analysis_timeout)
+        result = execute_command(command, timeout=analysis_timeout, log_as=f"Ghidra decompile {binary}")
 
         # Parse the JSON output from the script
         if result.get("success") and result.get("stdout"):
@@ -1139,6 +1144,7 @@ def ghidra_decompile():
 
                 try:
                     decompiled = json.loads(json_str)
+                    logger.info(f"Ghidra decompiled {binary} successfully")
                     return jsonify({
                         "success": True,
                         "binary": binary,
@@ -1181,7 +1187,7 @@ def binwalk():
             command += f" {additional_args}"
         command += f" {file_path}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Binwalk {file_path}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1202,7 +1208,7 @@ def checksec():
             return jsonify({"error": "Binary parameter is required"}), 400
 
         command = f"checksec --file={binary}"
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Checksec {binary}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1228,7 +1234,7 @@ def strings():
             command += f" {additional_args}"
         command += f" {file_path}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Strings {file_path}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1258,7 +1264,7 @@ def objdump():
             command += f" {additional_args}"
         command += f" {binary}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Objdump {binary}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1293,7 +1299,7 @@ def readelf():
             command += f" {additional_args}"
         command += f" {binary}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Readelf {binary}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1321,7 +1327,7 @@ def xxd():
             command += f" {additional_args}"
         command += f" {file_path}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"XXD {file_path}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1356,7 +1362,7 @@ def hexdump():
             command += f" {additional_args}"
         command += f" {file_path}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Hexdump {file_path}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1389,7 +1395,7 @@ def ropgadget():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"ROPgadget {binary}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1428,7 +1434,7 @@ def ropper():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Ropper {binary}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1450,7 +1456,7 @@ def one_gadget():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"One-gadget {libc_path}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1504,7 +1510,7 @@ p.interactive()
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Pwntools {target_binary or 'script'}")
 
         try:
             os.remove(script_file)
@@ -1575,7 +1581,7 @@ for func_addr, func in list(cfg.functions.items())[:10]:
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command, timeout=600)
+        result = execute_command(command, timeout=600, log_as=f"Angr {binary}")
 
         try:
             os.remove(script_file)
@@ -1616,7 +1622,7 @@ def libc_database():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Libc-database {action}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1646,7 +1652,7 @@ def pwninit():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Pwninit {binary}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1685,7 +1691,7 @@ def upx():
             command += f" {additional_args}"
         command += f" {binary}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"UPX {action} {binary}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1717,7 +1723,7 @@ def volatility():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Volatility {plugin} {memory_file}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1744,7 +1750,7 @@ def volatility3():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"Volatility3 {plugin} {memory_file}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -1787,7 +1793,7 @@ def msfvenom():
         if additional_args:
             command += f" {additional_args}"
 
-        result = execute_command(command)
+        result = execute_command(command, log_as=f"MSFVenom {payload}")
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)}"}), 500

@@ -51,15 +51,6 @@ class TestHealthEndpoints:
 class TestGhidraEndpoints:
     """Tests for Ghidra-related endpoints"""
 
-    def test_ghidra_missing_binary(self, client):
-        """Test ghidra endpoint returns error when binary is missing"""
-        response = client.post('/api/tools/ghidra',
-                              json={},
-                              content_type='application/json')
-        assert response.status_code == 400
-        data = json.loads(response.data)
-        assert 'error' in data
-
     def test_ghidra_decompile_missing_binary(self, client):
         """Test ghidra/decompile endpoint returns error when binary is missing"""
         response = client.post('/api/tools/ghidra/decompile',

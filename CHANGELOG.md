@@ -2,6 +2,23 @@
 
 All notable changes to BEAR will be documented in this file.
 
+## [1.2.0] - 2026-01-20
+
+### Added
+- Version display in server banner
+- `log_as` parameter for cleaner command logging
+- Success log for Ghidra decompilation
+
+### Changed
+- Improved logging format: `[LEVEL] message` style
+- Silenced verbose werkzeug request logs
+- All tool endpoints now use friendly log messages (e.g., "Executing: Checksec /bin/ls")
+- Simplified ColoredFormatter in MCP client (removed unused emojis)
+- Added VERSION constant to MCP client
+
+### Fixed
+- Removed obsolete test for non-existent `/api/tools/ghidra` endpoint
+
 ## [1.1.1] - 2026-01-19
 
 ### Added

@@ -86,7 +86,7 @@ class BearColors:
 Colors = BearColors
 
 class ColoredFormatter(logging.Formatter):
-    """Enhanced formatter with colors and emojis"""
+    """Enhanced formatter with colors"""
 
     COLORS = {
         'DEBUG': BearColors.DEBUG,
@@ -96,18 +96,9 @@ class ColoredFormatter(logging.Formatter):
         'CRITICAL': BearColors.CRITICAL
     }
 
-    EMOJIS = {
-        'DEBUG': '',
-        'INFO': '',
-        'WARNING': '',
-        'ERROR': '',
-        'CRITICAL': ''
-    }
-
     def format(self, record):
-        emoji = self.EMOJIS.get(record.levelname, '')
         color = self.COLORS.get(record.levelname, BearColors.BRIGHT_WHITE)
-        record.msg = f"{color}{emoji} {record.msg}{BearColors.RESET}"
+        record.msg = f"{color}{record.msg}{BearColors.RESET}"
         return super().format(record)
 
 # Setup logging
@@ -128,6 +119,7 @@ for handler in logging.getLogger().handlers:
 logger = logging.getLogger(__name__)
 
 # Default configuration
+VERSION = "1.2.0"
 DEFAULT_BEAR_SERVER = "http://127.0.0.1:8888"
 DEFAULT_REQUEST_TIMEOUT = 300
 MAX_RETRIES = 3
@@ -1339,7 +1331,7 @@ def main():
         logger.setLevel(logging.DEBUG)
         logger.debug("Debug logging enabled")
 
-    logger.info(f"Starting BEAR MCP Client")
+    logger.info(f"Starting BEAR MCP Client v{VERSION}")
     logger.info(f"Connecting to: {args.server}")
 
     try:
