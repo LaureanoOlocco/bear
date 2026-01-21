@@ -2,6 +2,22 @@
 
 All notable changes to BEAR will be documented in this file.
 
+## [1.3.0] - 2026-01-21
+
+### Added
+- Schema validation library for endpoint parameter validation
+- `tool_endpoint` decorator for consistent endpoint behavior
+- `cleanup_temp_file` helper function for temp file management
+
+### Changed
+- Refactored 19 tool endpoints to use schema validation decorator
+- Reduced ~350 lines of duplicate code across endpoints
+- Unified error handling: SchemaError/ValueError → 400, Exception → 500
+- Health check now always logs tool checks (removed verbose flag)
+
+### Removed
+- Volatility, Volatility3, MSFVenom, UPX tools and endpoints
+
 ## [1.2.0] - 2026-01-20
 
 ### Added
@@ -53,5 +69,4 @@ All notable changes to BEAR will be documented in this file.
 - MCP server with 25+ binary analysis tools
 - Support for GDB, Radare2, Ghidra, Binwalk, Checksec
 - Exploit development tools: Pwntools, ROPgadget, Ropper, One-Gadget
-- Memory forensics: Volatility, Volatility3
 - Compatible with Claude Desktop, Cursor, VS Code

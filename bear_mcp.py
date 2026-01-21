@@ -19,9 +19,6 @@ TOOLS AVAILABLE (25+):
 - Angr - Binary analysis platform with symbolic execution
 - Libc-Database - Libc identification and offset lookup
 - Pwninit - Automate binary exploitation setup
-- Volatility, Volatility3 - Memory forensics framework
-- MSFVenom - Payload generator
-- UPX - Executable packer/unpacker
 
 Architecture: MCP Client for AI agent communication with BEAR server
 Framework: FastMCP integration for tool orchestration
@@ -188,8 +185,9 @@ class BearClient:
     def execute_command(self, command: str, use_cache: bool = True) -> Dict[str, Any]:
         return self.safe_post("api/command", {"command": command, "use_cache": use_cache})
 
-    def check_health(self) -> Dict[str, Any]:
-        return self.safe_get("health")
+    def check_health(self, verbose: bool = False) -> Dict[str, Any]:
+        params = {"verbose": "true"} if verbose else None
+        return self.safe_get("health", params=params)
 
 
 def setup_mcp_server(bear_client: BearClient) -> FastMCP:
@@ -772,143 +770,6 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
             logger.error(f"pwninit setup failed")
         return result
 
-    # ============================================================================
-    # BINARY PACKING/UNPACKING
-    # ============================================================================
-
-    @mcp.tool()
-    def upx_analyze(binary: str, action: str = "decompress", output_file: str = "",
-                   additional_args: str = "") -> Dict[str, Any]:
-        """
-        Execute UPX for executable packing/unpacking.
-
-        Args:
-            binary: Path to the binary file
-            action: Action to perform (compress, decompress, test, list)
-            output_file: Output file path (optional)
-            additional_args: Additional UPX arguments
-
-        Returns:
-            UPX operation results
-        """
-        data = {
-            "binary": binary,
-            "action": action,
-            "output_file": output_file,
-            "additional_args": additional_args
-        }
-        logger.info(f"Starting UPX {action}: {binary}")
-        result = bear_client.safe_post("api/tools/upx", data)
-        if result.get("success"):
-            logger.info(f"UPX {action} completed for {binary}")
-        else:
-            logger.error(f"UPX {action} failed for {binary}")
-        return result
-
-    # ============================================================================
-    # MEMORY FORENSICS
-    # ============================================================================
-
-    @mcp.tool()
-    def volatility_analyze(memory_file: str, plugin: str, profile: str = "",
-                          additional_args: str = "") -> Dict[str, Any]:
-        """
-        Execute Volatility for memory forensics analysis.
-
-        Args:
-            memory_file: Path to memory dump file
-            plugin: Volatility plugin to use (pslist, pstree, filescan, etc.)
-            profile: Memory profile to use (Win10x64, LinuxUbuntu, etc.)
-            additional_args: Additional Volatility arguments
-
-        Returns:
-            Memory forensics analysis results
-        """
-        data = {
-            "memory_file": memory_file,
-            "plugin": plugin,
-            "profile": profile,
-            "additional_args": additional_args
-        }
-        logger.info(f"Starting Volatility analysis: {plugin}")
-        result = bear_client.safe_post("api/tools/volatility", data)
-        if result.get("success"):
-            logger.info(f"Volatility analysis completed")
-        else:
-            logger.error(f"Volatility analysis failed")
-        return result
-
-    @mcp.tool()
-    def volatility3_analyze(memory_file: str, plugin: str, output_file: str = "",
-                           additional_args: str = "") -> Dict[str, Any]:
-        """
-        Execute Volatility3 for advanced memory forensics.
-
-        Args:
-            memory_file: Path to memory dump file
-            plugin: Volatility3 plugin to execute (windows.pslist, linux.pslist, etc.)
-            output_file: Output file path
-            additional_args: Additional Volatility3 arguments
-
-        Returns:
-            Advanced memory forensics results
-        """
-        data = {
-            "memory_file": memory_file,
-            "plugin": plugin,
-            "output_file": output_file,
-            "additional_args": additional_args
-        }
-        logger.info(f"Starting Volatility3 analysis: {plugin}")
-        result = bear_client.safe_post("api/tools/volatility3", data)
-        if result.get("success"):
-            logger.info(f"Volatility3 analysis completed")
-        else:
-            logger.error(f"Volatility3 analysis failed")
-        return result
-
-    # ============================================================================
-    # PAYLOAD GENERATION
-    # ============================================================================
-
-    @mcp.tool()
-    def msfvenom_generate(payload: str, format_type: str = "", output_file: str = "",
-                         encoder: str = "", iterations: str = "", lhost: str = "",
-                         lport: str = "", additional_args: str = "") -> Dict[str, Any]:
-        """
-        Execute MSFVenom for payload generation.
-
-        Args:
-            payload: The payload to generate (e.g., linux/x64/shell_reverse_tcp)
-            format_type: Output format (elf, exe, raw, python, c, etc.)
-            output_file: Output file path
-            encoder: Encoder to use (e.g., x86/shikata_ga_nai)
-            iterations: Number of encoding iterations
-            lhost: Local host for reverse shells
-            lport: Local port for reverse shells
-            additional_args: Additional MSFVenom arguments
-
-        Returns:
-            Payload generation results
-        """
-        data = {
-            "payload": payload,
-            "format": format_type,
-            "output_file": output_file,
-            "encoder": encoder,
-            "iterations": iterations,
-            "lhost": lhost,
-            "lport": lport,
-            "additional_args": additional_args
-        }
-        logger.info(f"Starting MSFVenom payload generation: {payload}")
-        result = bear_client.safe_post("api/tools/msfvenom", data)
-        if result.get("success"):
-            logger.info(f"MSFVenom payload generated")
-        else:
-            logger.error(f"MSFVenom payload generation failed")
-        return result
-
     @mcp.tool()
     def generate_payload(payload_type: str = "buffer", size: int = 1024,
                         pattern: str = "A", filename: str = "") -> Dict[str, Any]:
@@ -1105,7 +966,7 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
             Server health information with tool availability
         """
         logger.info(f"Checking BEAR server health")
-        result = bear_client.check_health()
+        result = bear_client.check_health(verbose=True)
         if result.get("status") == "healthy":
             logger.info(f"Server is healthy - {result.get('total_tools_available', 0)} tools available")
         else:

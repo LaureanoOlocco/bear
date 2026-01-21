@@ -4,7 +4,7 @@
   <img src="assets/bear-logo.png" width="400" alt="BEAR logo">
 </p>
 
-# BEAR v1.1
+# BEAR v1.3
 ### Binary Exploitation & Automated Reversing
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
@@ -25,7 +25,6 @@ BEAR (Binary Exploitation & Automated Reversing) is an MCP (Model Context Protoc
 
 - **Binary Analysis Tools** - GDB, Radare2, Ghidra, Binwalk, Checksec
 - **Exploit Development** - Pwntools, ROPgadget, Ropper, One-Gadget
-- **Memory Forensics** - Volatility, Volatility3
 - **CVE Intelligence** - CVE lookup and exploit generation assistance
 - **MCP Protocol** - Compatible with Claude Desktop, Cursor, VS Code Copilot
 
@@ -55,7 +54,7 @@ Install the binary analysis tools you need:
 sudo apt install gdb binwalk checksec strings objdump
 
 # Optional
-# radare2, ghidra, volatility3, pwntools (pip install pwntools)
+# radare2, ghidra, pwntools (pip install pwntools)
 ```
 
 ---
@@ -95,8 +94,7 @@ python3 bear_server.py
 | Disassemblers | Radare2, Ghidra, Objdump |
 | Binary Inspection | Binwalk, Checksec, Strings, Readelf |
 | Exploit Dev | Pwntools, ROPgadget, Ropper, One-Gadget |
-| Memory Forensics | Volatility, Volatility3 |
-| Utilities | XXD, Hexdump, UPX |
+| Utilities | XXD, Hexdump |
 
 ---
 

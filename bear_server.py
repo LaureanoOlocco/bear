@@ -19,9 +19,6 @@ TOOLS AVAILABLE (25+):
 - Angr - Binary analysis platform with symbolic execution
 - Libc-Database - Libc identification and offset lookup
 - Pwninit - Automate binary exploitation setup
-- Volatility, Volatility3 - Memory forensics framework
-- MSFVenom - Payload generator
-- UPX - Executable packer/unpacker
 
 Architecture: REST API backend for BEAR MCP client
 Framework: Flask with enhanced command execution and caching
@@ -44,6 +41,8 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 from pathlib import Path
 from flask import Flask, request, jsonify
+from functools import wraps
+from schema import Schema, And, Optional as Opt, SchemaError
 import psutil
 
 # ============================================================================
@@ -79,7 +78,7 @@ app.config['JSON_SORT_KEYS'] = False
 API_PORT = int(os.environ.get('BEAR_PORT', 8888))
 API_HOST = os.environ.get('BEAR_HOST', '127.0.0.1')
 DEBUG_MODE = False
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Command execution settings
 COMMAND_TIMEOUT = int(os.environ.get('BEAR_TIMEOUT', 300))
@@ -89,6 +88,172 @@ CACHE_TTL = int(os.environ.get('BEAR_CACHE_TTL', 3600))
 # Global process management
 active_processes: Dict[int, Dict[str, Any]] = {}
 process_lock = threading.Lock()
+
+
+# ============================================================================
+# SCHEMA VALIDATION & ENDPOINT DECORATOR
+# ============================================================================
+
+def tool_endpoint(schema, tool_name, use_cache=False):
+    """Decorator for tool endpoints with schema validation and error handling"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper():
+            try:
+                params = schema.validate(request.json or {})
+                target = params.get('binary', params.get('file_path', params.get('libc_path', 'input')))
+                logger.info(f"Running {tool_name} on {target}")
+                result = func(params)
+                return jsonify(result)
+            except SchemaError as e:
+                logger.warning(f"[TOOL] {tool_name} - Validation error: {str(e)}")
+                return jsonify({"error": str(e)}), 400
+            except ValueError as e:
+                logger.warning(f"[TOOL] {tool_name} - Validation error: {str(e)}")
+                return jsonify({"error": str(e)}), 400
+            except Exception as e:
+                logger.error(f"[TOOL] {tool_name} - Error: {str(e)}")
+                return jsonify({"error": f"Server error: {str(e)}"}), 500
+        return wrapper
+    return decorator
+
+
+def cleanup_temp_file(filepath):
+    """Safely remove a temporary file"""
+    if filepath and os.path.exists(filepath):
+        try:
+            os.remove(filepath)
+        except:
+            pass
+
+
+# Tool Schemas
+SCHEMAS = {
+    "checksec": Schema({
+        "binary": And(str, len)
+    }),
+    "strings": Schema({
+        "file_path": And(str, len),
+        Opt("min_len"): int,
+        Opt("encoding"): str,
+        Opt("additional_args"): str
+    }),
+    "objdump": Schema({
+        "binary": And(str, len),
+        Opt("disassemble"): bool,
+        Opt("section"): str,
+        Opt("additional_args"): str
+    }),
+    "readelf": Schema({
+        "binary": And(str, len),
+        Opt("headers"): bool,
+        Opt("symbols"): bool,
+        Opt("sections"): bool,
+        Opt("all_info"): bool,
+        Opt("additional_args"): str
+    }),
+    "xxd": Schema({
+        "file_path": And(str, len),
+        Opt("offset"): str,
+        Opt("length"): str,
+        Opt("cols"): int,
+        Opt("reverse"): bool,
+        Opt("additional_args"): str
+    }),
+    "hexdump": Schema({
+        "file_path": And(str, len),
+        Opt("format_type"): str,
+        Opt("offset"): str,
+        Opt("length"): str,
+        Opt("additional_args"): str
+    }),
+    "binwalk": Schema({
+        "file_path": And(str, len),
+        Opt("extract"): bool,
+        Opt("signature"): bool,
+        Opt("entropy"): bool,
+        Opt("additional_args"): str
+    }),
+    "ropgadget": Schema({
+        "binary": And(str, len),
+        Opt("gadget_type"): str,
+        Opt("rop_chain"): bool,
+        Opt("depth"): int,
+        Opt("additional_args"): str
+    }),
+    "ropper": Schema({
+        "binary": And(str, len),
+        Opt("gadget_type"): str,
+        Opt("quality"): int,
+        Opt("arch"): str,
+        Opt("search_string"): str,
+        Opt("additional_args"): str
+    }),
+    "one_gadget": Schema({
+        "libc_path": And(str, len),
+        Opt("level"): int,
+        Opt("additional_args"): str
+    }),
+    "gdb": Schema({
+        "binary": And(str, len),
+        Opt("commands"): str,
+        Opt("script_file"): str,
+        Opt("additional_args"): str
+    }),
+    "gdb_peda": Schema({
+        Opt("binary"): str,
+        Opt("commands"): str,
+        Opt("attach_pid"): int,
+        Opt("core_file"): str,
+        Opt("additional_args"): str
+    }),
+    "gdb_gef": Schema({
+        Opt("binary"): str,
+        Opt("commands"): str,
+        Opt("attach_pid"): int,
+        Opt("core_file"): str,
+        Opt("additional_args"): str
+    }),
+    "radare2": Schema({
+        "binary": And(str, len),
+        Opt("commands"): str,
+        Opt("additional_args"): str
+    }),
+    "ghidra": Schema({
+        "binary": And(str, len),
+        Opt("function"): str,
+        Opt("timeout"): int
+    }),
+    "pwntools": Schema({
+        Opt("script_content"): str,
+        Opt("target_binary"): str,
+        Opt("target_host"): str,
+        Opt("target_port"): int,
+        Opt("exploit_type"): str,
+        Opt("additional_args"): str
+    }),
+    "angr": Schema({
+        "binary": And(str, len),
+        Opt("script_content"): str,
+        Opt("analysis_type"): str,
+        Opt("find_address"): str,
+        Opt("avoid_addresses"): str,
+        Opt("additional_args"): str
+    }),
+    "libc_database": Schema({
+        Opt("action"): str,
+        Opt("symbols"): str,
+        Opt("libc_id"): str,
+        Opt("additional_args"): str
+    }),
+    "pwninit": Schema({
+        "binary": And(str, len),
+        Opt("libc"): str,
+        Opt("ld"): str,
+        Opt("template_type"): str,
+        Opt("additional_args"): str
+    }),
+}
 
 
 # ============================================================================
@@ -372,10 +537,9 @@ class ProcessManager:
 class EnhancedCommandExecutor:
     """Enhanced command executor with progress tracking"""
 
-    def __init__(self, command: str, timeout: int = COMMAND_TIMEOUT, log_as: str = ""):
+    def __init__(self, command: str, timeout: int = COMMAND_TIMEOUT):
         self.command = command
         self.timeout = timeout
-        self.log_as = log_as
         self.process = None
         self.stdout_data = ""
         self.stderr_data = ""
@@ -401,8 +565,6 @@ class EnhancedCommandExecutor:
 
     def execute(self) -> Dict[str, Any]:
         self.start_time = time.time()
-        log_msg = self.log_as if self.log_as else self.command
-        logger.info(f"Executing: {log_msg}")
 
         try:
             self.process = subprocess.Popen(
@@ -476,14 +638,14 @@ class EnhancedCommandExecutor:
             }
 
 
-def execute_command(command: str, use_cache: bool = True, timeout: int = COMMAND_TIMEOUT, log_as: str = "") -> Dict[str, Any]:
+def execute_command(command: str, use_cache: bool = True, timeout: int = COMMAND_TIMEOUT) -> Dict[str, Any]:
     """Execute a shell command with caching support"""
     if use_cache:
         cached_result = cache.get(command, {})
         if cached_result:
             return cached_result
 
-    executor = EnhancedCommandExecutor(command, timeout, log_as)
+    executor = EnhancedCommandExecutor(command, timeout)
     result = executor.execute()
 
     if use_cache and result.get("success", False):
@@ -672,14 +834,17 @@ def find_ghidra_headless():
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
+    logger.info("Performing health check...")
+
     binary_tools = [
         "gdb", "radare2", "binwalk", "ropgadget", "checksec", "objdump",
         "one-gadget", "ropper", "angr", "pwninit", "strings",
-        "xxd", "readelf", "hexdump", "upx", "volatility", "msfvenom"
+        "xxd", "readelf", "hexdump"
     ]
 
     tools_status = {}
     for tool in binary_tools:
+        logger.info(f"Checking tool: {tool}")
         try:
             result = execute_command(f"which {tool}", use_cache=True)
             tools_status[tool] = result["success"]
@@ -687,7 +852,7 @@ def health_check():
             tools_status[tool] = False
 
     # Check Ghidra separately using find_ghidra_headless
-    logger.info("Checking: Ghidra installation")
+    logger.info("Checking tool: ghidra")
     tools_status["ghidra"] = find_ghidra_headless() is not None
 
     available_count = sum(1 for available in tools_status.values() if available)
@@ -719,6 +884,7 @@ def generic_command():
         result = execute_command(command, use_cache)
         return jsonify(result)
     except Exception as e:
+        logger.error(f"[API] /api/command - Error: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 
@@ -927,271 +1093,193 @@ def execute_script():
 # ============================================================================
 
 @app.route("/api/tools/gdb", methods=["POST"])
-def gdb():
+@tool_endpoint(SCHEMAS["gdb"], "gdb")
+def gdb(params):
     """Execute GDB for binary analysis and debugging"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        commands = params.get("commands", "")
-        script_file = params.get("script_file", "")
-        additional_args = params.get("additional_args", "")
-
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
-
-        command = f"gdb {binary}"
-        if script_file:
-            command += f" -x {script_file}"
-        if commands:
-            temp_script = "/tmp/gdb_commands.txt"
-            with open(temp_script, "w") as f:
-                f.write(commands)
-            command += f" -x {temp_script}"
-        if additional_args:
-            command += f" {additional_args}"
-        command += " -batch"
-
-        result = execute_command(command, log_as=f"GDB {binary}")
-
-        if commands and os.path.exists("/tmp/gdb_commands.txt"):
-            try:
-                os.remove("/tmp/gdb_commands.txt")
-            except:
-                pass
-
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    temp_script = None
+    command = f"gdb {params['binary']}"
+    if params.get("script_file"):
+        command += f" -x {params['script_file']}"
+    if params.get("commands"):
+        temp_script = "/tmp/gdb_commands.txt"
+        with open(temp_script, "w") as f:
+            f.write(params["commands"])
+        command += f" -x {temp_script}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    command += " -batch"
+    result = execute_command(command)
+    cleanup_temp_file(temp_script)
+    return result
 
 
 @app.route("/api/tools/gdb-peda", methods=["POST"])
-def gdb_peda():
+@tool_endpoint(SCHEMAS["gdb_peda"], "gdb-peda")
+def gdb_peda(params):
     """Execute GDB with PEDA for enhanced debugging"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        commands = params.get("commands", "")
-        attach_pid = params.get("attach_pid", 0)
-        core_file = params.get("core_file", "")
-        additional_args = params.get("additional_args", "")
+    binary = params.get("binary", "")
+    attach_pid = params.get("attach_pid", 0)
+    core_file = params.get("core_file", "")
+    if not binary and not attach_pid and not core_file:
+        raise ValueError("Binary, PID, or core file is required")
 
-        if not binary and not attach_pid and not core_file:
-            return jsonify({"error": "Binary, PID, or core file is required"}), 400
+    temp_script = None
+    command = "gdb -q"
+    if binary:
+        command += f" {binary}"
+    if core_file:
+        command += f" {core_file}"
+    if attach_pid:
+        command += f" -p {attach_pid}"
 
-        command = "gdb -q"
-        if binary:
-            command += f" {binary}"
-        if core_file:
-            command += f" {core_file}"
-        if attach_pid:
-            command += f" -p {attach_pid}"
+    if params.get("commands"):
+        temp_script = "/tmp/gdb_peda_commands.txt"
+        peda_commands = f"source ~/peda/peda.py\n{params['commands']}\nquit"
+        with open(temp_script, "w") as f:
+            f.write(peda_commands)
+        command += f" -x {temp_script}"
+    else:
+        command += " -ex 'source ~/peda/peda.py' -ex 'quit'"
 
-        if commands:
-            temp_script = "/tmp/gdb_peda_commands.txt"
-            peda_commands = f"source ~/peda/peda.py\n{commands}\nquit"
-            with open(temp_script, "w") as f:
-                f.write(peda_commands)
-            command += f" -x {temp_script}"
-        else:
-            command += " -ex 'source ~/peda/peda.py' -ex 'quit'"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
 
-        if additional_args:
-            command += f" {additional_args}"
-
-        result = execute_command(command, log_as=f"GDB-PEDA {binary or core_file or f'PID:{attach_pid}'}")
-
-        if commands and os.path.exists("/tmp/gdb_peda_commands.txt"):
-            try:
-                os.remove("/tmp/gdb_peda_commands.txt")
-            except:
-                pass
-
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    result = execute_command(command)
+    cleanup_temp_file(temp_script)
+    return result
 
 
 @app.route("/api/tools/gdb-gef", methods=["POST"])
-def gdb_gef():
+@tool_endpoint(SCHEMAS["gdb_gef"], "gdb-gef")
+def gdb_gef(params):
     """Execute GDB with GEF for exploit development"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        commands = params.get("commands", "")
-        attach_pid = params.get("attach_pid", 0)
-        core_file = params.get("core_file", "")
-        additional_args = params.get("additional_args", "")
+    binary = params.get("binary", "")
+    attach_pid = params.get("attach_pid", 0)
+    core_file = params.get("core_file", "")
+    if not binary and not attach_pid and not core_file:
+        raise ValueError("Binary, PID, or core file is required")
 
-        if not binary and not attach_pid and not core_file:
-            return jsonify({"error": "Binary, PID, or core file is required"}), 400
+    temp_script = None
+    command = "gdb -q"
+    if binary:
+        command += f" {binary}"
+    if core_file:
+        command += f" {core_file}"
+    if attach_pid:
+        command += f" -p {attach_pid}"
 
-        command = "gdb -q"
-        if binary:
-            command += f" {binary}"
-        if core_file:
-            command += f" {core_file}"
-        if attach_pid:
-            command += f" -p {attach_pid}"
+    if params.get("commands"):
+        temp_script = "/tmp/gdb_gef_commands.txt"
+        gef_commands = f"source ~/.gdbinit-gef.py\n{params['commands']}\nquit"
+        with open(temp_script, "w") as f:
+            f.write(gef_commands)
+        command += f" -x {temp_script}"
+    else:
+        command += " -ex 'source ~/.gdbinit-gef.py' -ex 'quit'"
 
-        if commands:
-            temp_script = "/tmp/gdb_gef_commands.txt"
-            gef_commands = f"source ~/.gdbinit-gef.py\n{commands}\nquit"
-            with open(temp_script, "w") as f:
-                f.write(gef_commands)
-            command += f" -x {temp_script}"
-        else:
-            command += " -ex 'source ~/.gdbinit-gef.py' -ex 'quit'"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
 
-        if additional_args:
-            command += f" {additional_args}"
-
-        result = execute_command(command, log_as=f"GDB-GEF {binary or core_file or f'PID:{attach_pid}'}")
-
-        if commands and os.path.exists("/tmp/gdb_gef_commands.txt"):
-            try:
-                os.remove("/tmp/gdb_gef_commands.txt")
-            except:
-                pass
-
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    result = execute_command(command)
+    cleanup_temp_file(temp_script)
+    return result
 
 
 @app.route("/api/tools/radare2", methods=["POST"])
-def radare2():
+@tool_endpoint(SCHEMAS["radare2"], "radare2")
+def radare2(params):
     """Execute Radare2 for binary analysis"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        commands = params.get("commands", "")
-        additional_args = params.get("additional_args", "")
+    temp_script = None
+    if params.get("commands"):
+        temp_script = "/tmp/r2_commands.txt"
+        with open(temp_script, "w") as f:
+            f.write(params["commands"])
+        command = f"r2 -i {temp_script} -q {params['binary']}"
+    else:
+        command = f"r2 -q {params['binary']}"
 
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
 
-        if commands:
-            temp_script = "/tmp/r2_commands.txt"
-            with open(temp_script, "w") as f:
-                f.write(commands)
-            command = f"r2 -i {temp_script} -q {binary}"
-        else:
-            command = f"r2 -q {binary}"
-
-        if additional_args:
-            command += f" {additional_args}"
-
-        result = execute_command(command, log_as=f"Radare2 {binary}")
-
-        if commands and os.path.exists("/tmp/r2_commands.txt"):
-            try:
-                os.remove("/tmp/r2_commands.txt")
-            except:
-                pass
-
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    result = execute_command(command)
+    cleanup_temp_file(temp_script)
+    return result
 
 
 @app.route("/api/tools/ghidra/decompile", methods=["POST"])
-def ghidra_decompile():
+@tool_endpoint(SCHEMAS["ghidra"], "ghidra")
+def ghidra_decompile(params):
     """Decompile binary using Ghidra headless mode with custom script"""
-    try:
-        params = request.json
-        if not params:
-            return jsonify({"error": "Request body must be JSON with Content-Type: application/json"}), 400
+    binary = params["binary"]
+    function_name = params.get("function", "all")
+    analysis_timeout = params.get("timeout", 300)
 
-        binary = params.get("binary", "")
-        function_name = params.get("function", "all")
-        analysis_timeout = params.get("timeout", 300)
+    if not os.path.exists(binary):
+        raise ValueError(f"Binary not found: {binary}")
 
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
+    ghidra_headless = find_ghidra_headless()
+    if not ghidra_headless:
+        raise ValueError("Ghidra analyzeHeadless not found. Set GHIDRA_HEADLESS environment variable.")
 
-        if not os.path.exists(binary):
-            return jsonify({"error": f"Binary not found: {binary}"}), 400
+    script_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ghidra_scripts")
+    decompile_script = "DecompileFunction.java"
 
-        # Find Ghidra analyzeHeadless
-        ghidra_headless = find_ghidra_headless()
-        if not ghidra_headless:
-            return jsonify({"error": "Ghidra analyzeHeadless not found. Set GHIDRA_HEADLESS environment variable."}), 500
+    if not os.path.exists(os.path.join(script_dir, decompile_script)):
+        raise ValueError(f"Decompile script not found: {script_dir}/{decompile_script}")
 
-        # Get the script path relative to this file
-        script_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ghidra_scripts")
-        decompile_script = "DecompileFunction.java"
+    project_dir = f"/tmp/ghidra_projects/decompile_{os.path.basename(binary)}_{int(time.time())}"
+    os.makedirs(project_dir, exist_ok=True)
 
-        if not os.path.exists(os.path.join(script_dir, decompile_script)):
-            return jsonify({"error": f"Decompile script not found: {script_dir}/{decompile_script}"}), 500
+    command = f'"{ghidra_headless}" "{project_dir}" decompile_project -import "{binary}" -scriptPath "{script_dir}" -postScript {decompile_script} "{function_name}" -deleteProject'
+    result = execute_command(command, timeout=analysis_timeout)
 
-        project_dir = f"/tmp/ghidra_projects/decompile_{os.path.basename(binary)}_{int(time.time())}"
-        os.makedirs(project_dir, exist_ok=True)
+    if result.get("success") and result.get("stdout"):
+        stdout = result["stdout"]
+        start_marker = "===BEAR_JSON_START==="
+        end_marker = "===BEAR_JSON_END==="
 
-        # Build the command
-        command = f'"{ghidra_headless}" "{project_dir}" decompile_project -import "{binary}" -scriptPath "{script_dir}" -postScript {decompile_script} "{function_name}" -deleteProject'
+        if start_marker in stdout and end_marker in stdout:
+            json_start = stdout.index(start_marker) + len(start_marker)
+            json_end = stdout.index(end_marker)
+            json_str = stdout[json_start:json_end].strip()
 
-        result = execute_command(command, timeout=analysis_timeout, log_as=f"Ghidra decompile {binary}")
+            try:
+                decompiled = json.loads(json_str)
+                return {
+                    "success": True,
+                    "binary": binary,
+                    "function": function_name,
+                    "decompiled": decompiled
+                }
+            except json.JSONDecodeError as e:
+                return {
+                    "success": False,
+                    "error": f"Failed to parse decompilation output: {str(e)}",
+                    "raw_output": stdout
+                }
 
-        # Parse the JSON output from the script
-        if result.get("success") and result.get("stdout"):
-            stdout = result["stdout"]
-            start_marker = "===BEAR_JSON_START==="
-            end_marker = "===BEAR_JSON_END==="
-
-            if start_marker in stdout and end_marker in stdout:
-                json_start = stdout.index(start_marker) + len(start_marker)
-                json_end = stdout.index(end_marker)
-                json_str = stdout[json_start:json_end].strip()
-
-                try:
-                    decompiled = json.loads(json_str)
-                    logger.info(f"Ghidra decompiled {binary} successfully")
-                    return jsonify({
-                        "success": True,
-                        "binary": binary,
-                        "function": function_name,
-                        "decompiled": decompiled
-                    })
-                except json.JSONDecodeError as e:
-                    return jsonify({
-                        "success": False,
-                        "error": f"Failed to parse decompilation output: {str(e)}",
-                        "raw_output": stdout
-                    })
-
-        return jsonify({
-            "success": False,
-            "error": "Decompilation failed or produced no output",
-            "details": result
-        })
-
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    return {
+        "success": False,
+        "error": "Decompilation failed or produced no output",
+        "details": result
+    }
 
 
 @app.route("/api/tools/binwalk", methods=["POST"])
-def binwalk():
+@tool_endpoint(SCHEMAS["binwalk"], "binwalk")
+def binwalk(params):
     """Execute Binwalk for firmware analysis"""
-    try:
-        params = request.json
-        file_path = params.get("file_path", "")
-        extract = params.get("extract", False)
-        additional_args = params.get("additional_args", "")
-
-        if not file_path:
-            return jsonify({"error": "File path is required"}), 400
-
-        command = "binwalk"
-        if extract:
-            command += " -e"
-        if additional_args:
-            command += f" {additional_args}"
-        command += f" {file_path}"
-
-        result = execute_command(command, log_as=f"Binwalk {file_path}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    command = "binwalk"
+    if params.get("extract"):
+        command += " -e"
+    if params.get("signature"):
+        command += " -B"
+    if params.get("entropy"):
+        command += " -E"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    command += f" {params['file_path']}"
+    return execute_command(command)
 
 
 # ============================================================================
@@ -1199,174 +1287,99 @@ def binwalk():
 # ============================================================================
 
 @app.route("/api/tools/checksec", methods=["POST"])
-def checksec():
+@tool_endpoint(SCHEMAS["checksec"], "checksec")
+def checksec(params):
     """Check security features of a binary"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
-
-        command = f"checksec --file={binary}"
-        result = execute_command(command, log_as=f"Checksec {binary}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    command = f"checksec --file={params['binary']}"
+    return execute_command(command, use_cache=True)
 
 
 @app.route("/api/tools/strings", methods=["POST"])
-def strings():
+@tool_endpoint(SCHEMAS["strings"], "strings")
+def strings(params):
     """Extract strings from a binary"""
-    try:
-        params = request.json
-        file_path = params.get("file_path", "")
-        min_len = params.get("min_len", 4)
-        encoding = params.get("encoding", "")
-        additional_args = params.get("additional_args", "")
-
-        if not file_path:
-            return jsonify({"error": "File path is required"}), 400
-
-        command = f"strings -n {min_len}"
-        if encoding:
-            command += f" -e {encoding}"
-        if additional_args:
-            command += f" {additional_args}"
-        command += f" {file_path}"
-
-        result = execute_command(command, log_as=f"Strings {file_path}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    min_len = params.get("min_len", 4)
+    command = f"strings -n {min_len}"
+    if params.get("encoding"):
+        command += f" -e {params['encoding']}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    command += f" {params['file_path']}"
+    return execute_command(command)
 
 
 @app.route("/api/tools/objdump", methods=["POST"])
-def objdump():
+@tool_endpoint(SCHEMAS["objdump"], "objdump")
+def objdump(params):
     """Analyze a binary using objdump"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        disassemble = params.get("disassemble", True)
-        section = params.get("section", "")
-        additional_args = params.get("additional_args", "")
-
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
-
-        command = "objdump -M intel"
-        if disassemble:
-            command += " -d"
-        else:
-            command += " -x"
-        if section:
-            command += f" -j {section}"
-        if additional_args:
-            command += f" {additional_args}"
-        command += f" {binary}"
-
-        result = execute_command(command, log_as=f"Objdump {binary}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    command = "objdump -M intel"
+    if params.get("disassemble", True):
+        command += " -d"
+    else:
+        command += " -x"
+    if params.get("section"):
+        command += f" -j {params['section']}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    command += f" {params['binary']}"
+    return execute_command(command)
 
 
 @app.route("/api/tools/readelf", methods=["POST"])
-def readelf():
+@tool_endpoint(SCHEMAS["readelf"], "readelf")
+def readelf(params):
     """Analyze ELF file headers and structure"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        headers = params.get("headers", True)
-        symbols = params.get("symbols", False)
-        sections = params.get("sections", False)
-        all_info = params.get("all_info", False)
-        additional_args = params.get("additional_args", "")
-
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
-
-        command = "readelf"
-        if all_info:
-            command += " -a"
-        else:
-            if headers:
-                command += " -h"
-            if symbols:
-                command += " -s"
-            if sections:
-                command += " -S"
-        if additional_args:
-            command += f" {additional_args}"
-        command += f" {binary}"
-
-        result = execute_command(command, log_as=f"Readelf {binary}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    command = "readelf"
+    if params.get("all_info"):
+        command += " -a"
+    else:
+        if params.get("headers", True):
+            command += " -h"
+        if params.get("symbols"):
+            command += " -s"
+        if params.get("sections"):
+            command += " -S"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    command += f" {params['binary']}"
+    return execute_command(command)
 
 
 @app.route("/api/tools/xxd", methods=["POST"])
-def xxd():
+@tool_endpoint(SCHEMAS["xxd"], "xxd")
+def xxd(params):
     """Create a hex dump using xxd"""
-    try:
-        params = request.json
-        file_path = params.get("file_path", "")
-        offset = params.get("offset", "0")
-        length = params.get("length", "")
-        cols = params.get("cols", 16)
-        additional_args = params.get("additional_args", "")
-
-        if not file_path:
-            return jsonify({"error": "File path is required"}), 400
-
-        command = f"xxd -s {offset}"
-        if length:
-            command += f" -l {length}"
-        command += f" -c {cols}"
-        if additional_args:
-            command += f" {additional_args}"
-        command += f" {file_path}"
-
-        result = execute_command(command, log_as=f"XXD {file_path}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    command = f"xxd -s {params.get('offset', '0')}"
+    if params.get("length"):
+        command += f" -l {params['length']}"
+    command += f" -c {params.get('cols', 16)}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    command += f" {params['file_path']}"
+    return execute_command(command)
 
 
 @app.route("/api/tools/hexdump", methods=["POST"])
-def hexdump():
+@tool_endpoint(SCHEMAS["hexdump"], "hexdump")
+def hexdump(params):
     """Create a hex dump using hexdump"""
-    try:
-        params = request.json
-        file_path = params.get("file_path", "")
-        format_type = params.get("format_type", "canonical")
-        offset = params.get("offset", "0")
-        length = params.get("length", "")
-        additional_args = params.get("additional_args", "")
-
-        if not file_path:
-            return jsonify({"error": "File path is required"}), 400
-
-        command = "hexdump"
-        if format_type == "canonical":
-            command += " -C"
-        elif format_type == "one-byte-octal":
-            command += " -b"
-        elif format_type == "two-byte-decimal":
-            command += " -d"
-        if offset != "0":
-            command += f" -s {offset}"
-        if length:
-            command += f" -n {length}"
-        if additional_args:
-            command += f" {additional_args}"
-        command += f" {file_path}"
-
-        result = execute_command(command, log_as=f"Hexdump {file_path}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    format_type = params.get("format_type", "canonical")
+    command = "hexdump"
+    if format_type == "canonical":
+        command += " -C"
+    elif format_type == "one-byte-octal":
+        command += " -b"
+    elif format_type == "two-byte-decimal":
+        command += " -d"
+    offset = params.get("offset", "0")
+    if offset != "0":
+        command += f" -s {offset}"
+    if params.get("length"):
+        command += f" -n {params['length']}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    command += f" {params['file_path']}"
+    return execute_command(command)
 
 
 # ============================================================================
@@ -1374,117 +1387,75 @@ def hexdump():
 # ============================================================================
 
 @app.route("/api/tools/ropgadget", methods=["POST"])
-def ropgadget():
+@tool_endpoint(SCHEMAS["ropgadget"], "ropgadget")
+def ropgadget(params):
     """Search for ROP gadgets using ROPgadget"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        gadget_type = params.get("gadget_type", "")
-        rop_chain = params.get("rop_chain", False)
-        depth = params.get("depth", 10)
-        additional_args = params.get("additional_args", "")
-
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
-
-        command = f"ROPgadget --binary {binary}"
-        if gadget_type:
-            command += f" --only '{gadget_type}'"
-        if rop_chain:
-            command += " --ropchain"
-        command += f" --depth {depth}"
-        if additional_args:
-            command += f" {additional_args}"
-
-        result = execute_command(command, log_as=f"ROPgadget {binary}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    command = f"ROPgadget --binary {params['binary']}"
+    if params.get("gadget_type"):
+        command += f" --only '{params['gadget_type']}'"
+    if params.get("rop_chain"):
+        command += " --ropchain"
+    command += f" --depth {params.get('depth', 10)}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    return execute_command(command)
 
 
 @app.route("/api/tools/ropper", methods=["POST"])
-def ropper():
+@tool_endpoint(SCHEMAS["ropper"], "ropper")
+def ropper(params):
     """Execute ropper for ROP/JOP gadget searching"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        gadget_type = params.get("gadget_type", "rop")
-        quality = params.get("quality", 1)
-        arch = params.get("arch", "")
-        search_string = params.get("search_string", "")
-        additional_args = params.get("additional_args", "")
-
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
-
-        command = f"ropper --file {binary}"
-        if gadget_type == "rop":
-            command += " --rop"
-        elif gadget_type == "jop":
-            command += " --jop"
-        elif gadget_type == "sys":
-            command += " --sys"
-        elif gadget_type == "all":
-            command += " --all"
-        if quality > 1:
-            command += f" --quality {quality}"
-        if arch:
-            command += f" --arch {arch}"
-        if search_string:
-            command += f" --search '{search_string}'"
-        if additional_args:
-            command += f" {additional_args}"
-
-        result = execute_command(command, log_as=f"Ropper {binary}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    command = f"ropper --file {params['binary']}"
+    gadget_type = params.get("gadget_type", "rop")
+    if gadget_type == "rop":
+        command += " --rop"
+    elif gadget_type == "jop":
+        command += " --jop"
+    elif gadget_type == "sys":
+        command += " --sys"
+    elif gadget_type == "all":
+        command += " --all"
+    quality = params.get("quality", 1)
+    if quality > 1:
+        command += f" --quality {quality}"
+    if params.get("arch"):
+        command += f" --arch {params['arch']}"
+    if params.get("search_string"):
+        command += f" --search '{params['search_string']}'"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    return execute_command(command)
 
 
 @app.route("/api/tools/one-gadget", methods=["POST"])
-def one_gadget():
+@tool_endpoint(SCHEMAS["one_gadget"], "one-gadget")
+def one_gadget(params):
     """Find one-shot RCE gadgets in libc"""
-    try:
-        params = request.json
-        libc_path = params.get("libc_path", "")
-        level = params.get("level", 1)
-        additional_args = params.get("additional_args", "")
-
-        if not libc_path:
-            return jsonify({"error": "libc_path parameter is required"}), 400
-
-        command = f"one_gadget {libc_path} --level {level}"
-        if additional_args:
-            command += f" {additional_args}"
-
-        result = execute_command(command, log_as=f"One-gadget {libc_path}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    command = f"one_gadget {params['libc_path']} --level {params.get('level', 1)}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    return execute_command(command)
 
 
 @app.route("/api/tools/pwntools", methods=["POST"])
-def pwntools():
+@tool_endpoint(SCHEMAS["pwntools"], "pwntools")
+def pwntools(params):
     """Execute Pwntools for exploit development"""
-    try:
-        params = request.json
-        script_content = params.get("script_content", "")
-        target_binary = params.get("target_binary", "")
-        target_host = params.get("target_host", "")
-        target_port = params.get("target_port", 0)
-        exploit_type = params.get("exploit_type", "local")
-        additional_args = params.get("additional_args", "")
+    script_content = params.get("script_content", "")
+    target_binary = params.get("target_binary", "")
+    target_host = params.get("target_host", "")
+    target_port = params.get("target_port", 0)
 
-        if not script_content and not target_binary:
-            return jsonify({"error": "Script content or target binary is required"}), 400
+    if not script_content and not target_binary:
+        raise ValueError("Script content or target binary is required")
 
-        script_file = "/tmp/pwntools_exploit.py"
+    script_file = "/tmp/pwntools_exploit.py"
 
-        if script_content:
-            with open(script_file, "w") as f:
-                f.write(script_content)
-        else:
-            template = f"""#!/usr/bin/env python3
+    if script_content:
+        with open(script_file, "w") as f:
+            f.write(script_content)
+    else:
+        template = f"""#!/usr/bin/env python3
 from pwn import *
 context.arch = 'amd64'
 context.os = 'linux'
@@ -1504,47 +1475,35 @@ else:
 
 p.interactive()
 """
-            with open(script_file, "w") as f:
-                f.write(template)
+        with open(script_file, "w") as f:
+            f.write(template)
 
-        command = f"python3 {script_file}"
-        if additional_args:
-            command += f" {additional_args}"
+    command = f"python3 {script_file}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
 
-        result = execute_command(command, log_as=f"Pwntools {target_binary or 'script'}")
-
-        try:
-            os.remove(script_file)
-        except:
-            pass
-
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    result = execute_command(command)
+    cleanup_temp_file(script_file)
+    return result
 
 
 @app.route("/api/tools/angr", methods=["POST"])
-def angr():
+@tool_endpoint(SCHEMAS["angr"], "angr")
+def angr(params):
     """Execute angr for symbolic execution"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        script_content = params.get("script_content", "")
-        find_address = params.get("find_address", "")
-        avoid_addresses = params.get("avoid_addresses", "")
-        analysis_type = params.get("analysis_type", "symbolic")
-        additional_args = params.get("additional_args", "")
+    binary = params["binary"]
+    script_content = params.get("script_content", "")
+    find_address = params.get("find_address", "")
+    avoid_addresses = params.get("avoid_addresses", "")
+    analysis_type = params.get("analysis_type", "symbolic")
 
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
+    script_file = "/tmp/angr_analysis.py"
 
-        script_file = "/tmp/angr_analysis.py"
-
-        if script_content:
-            with open(script_file, "w") as f:
-                f.write(script_content)
-        else:
-            template = f"""#!/usr/bin/env python3
+    if script_content:
+        with open(script_file, "w") as f:
+            f.write(script_content)
+    else:
+        template = f"""#!/usr/bin/env python3
 import angr
 import sys
 
@@ -1553,8 +1512,8 @@ print(f"Loaded binary: {binary}")
 print(f"Architecture: {{project.arch}}")
 print(f"Entry point: {{hex(project.entry)}}")
 """
-            if analysis_type == "symbolic" and find_address:
-                template += f"""
+        if analysis_type == "symbolic" and find_address:
+            template += f"""
 state = project.factory.entry_state()
 simgr = project.factory.simulation_manager(state)
 find_addr = {find_address}
@@ -1567,237 +1526,70 @@ if simgr.found:
 else:
     print("No solution found")
 """
-            elif analysis_type == "cfg":
-                template += """
+        elif analysis_type == "cfg":
+            template += """
 cfg = project.analyses.CFGFast()
 print(f"CFG nodes: {len(cfg.graph.nodes())}")
 print(f"CFG edges: {len(cfg.graph.edges())}")
 for func_addr, func in list(cfg.functions.items())[:10]:
     print(f"Function: {func.name} at {hex(func_addr)}")
 """
-            with open(script_file, "w") as f:
-                f.write(template)
+        with open(script_file, "w") as f:
+            f.write(template)
 
-        command = f"python3 {script_file}"
-        if additional_args:
-            command += f" {additional_args}"
+    command = f"python3 {script_file}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
 
-        result = execute_command(command, timeout=600, log_as=f"Angr {binary}")
-
-        try:
-            os.remove(script_file)
-        except:
-            pass
-
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    result = execute_command(command, timeout=600)
+    cleanup_temp_file(script_file)
+    return result
 
 
 @app.route("/api/tools/libc-database", methods=["POST"])
-def libc_database():
+@tool_endpoint(SCHEMAS["libc_database"], "libc-database")
+def libc_database(params):
     """Libc identification and offset lookup"""
-    try:
-        params = request.json
-        action = params.get("action", "find")
-        symbols = params.get("symbols", "")
-        libc_id = params.get("libc_id", "")
-        additional_args = params.get("additional_args", "")
+    action = params.get("action", "find")
+    symbols = params.get("symbols", "")
+    libc_id = params.get("libc_id", "")
 
-        if action == "find" and not symbols:
-            return jsonify({"error": "Symbols parameter is required for find action"}), 400
-        if action in ["dump", "download"] and not libc_id:
-            return jsonify({"error": "libc_id parameter is required for dump/download actions"}), 400
+    if action == "find" and not symbols:
+        raise ValueError("Symbols parameter is required for find action")
+    if action in ["dump", "download"] and not libc_id:
+        raise ValueError("libc_id parameter is required for dump/download actions")
 
-        base_command = "cd /opt/libc-database 2>/dev/null || cd ~/libc-database 2>/dev/null"
+    base_command = "cd /opt/libc-database 2>/dev/null || cd ~/libc-database 2>/dev/null"
 
-        if action == "find":
-            command = f"{base_command} && ./find {symbols}"
-        elif action == "dump":
-            command = f"{base_command} && ./dump {libc_id}"
-        elif action == "download":
-            command = f"{base_command} && ./download {libc_id}"
-        else:
-            return jsonify({"error": f"Invalid action: {action}"}), 400
+    if action == "find":
+        command = f"{base_command} && ./find {symbols}"
+    elif action == "dump":
+        command = f"{base_command} && ./dump {libc_id}"
+    elif action == "download":
+        command = f"{base_command} && ./download {libc_id}"
+    else:
+        raise ValueError(f"Invalid action: {action}")
 
-        if additional_args:
-            command += f" {additional_args}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
 
-        result = execute_command(command, log_as=f"Libc-database {action}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    return execute_command(command)
 
 
 @app.route("/api/tools/pwninit", methods=["POST"])
-def pwninit():
+@tool_endpoint(SCHEMAS["pwninit"], "pwninit")
+def pwninit(params):
     """CTF binary exploitation setup"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        libc = params.get("libc", "")
-        ld = params.get("ld", "")
-        template_type = params.get("template_type", "python")
-        additional_args = params.get("additional_args", "")
-
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
-
-        command = f"pwninit --bin {binary}"
-        if libc:
-            command += f" --libc {libc}"
-        if ld:
-            command += f" --ld {ld}"
-        if template_type:
-            command += f" --template-type {template_type}"
-        if additional_args:
-            command += f" {additional_args}"
-
-        result = execute_command(command, log_as=f"Pwninit {binary}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
-
-
-# ============================================================================
-# BINARY ANALYSIS TOOLS - PACKING/UNPACKING
-# ============================================================================
-
-@app.route("/api/tools/upx", methods=["POST"])
-def upx():
-    """Execute UPX for packing/unpacking"""
-    try:
-        params = request.json
-        binary = params.get("binary", "")
-        action = params.get("action", "decompress")
-        output_file = params.get("output_file", "")
-        additional_args = params.get("additional_args", "")
-
-        if not binary:
-            return jsonify({"error": "Binary parameter is required"}), 400
-
-        command = "upx"
-        if action == "decompress":
-            command += " -d"
-        elif action == "compress":
-            command += " -9"
-        elif action == "test":
-            command += " -t"
-        elif action == "list":
-            command += " -l"
-
-        if output_file:
-            command += f" -o {output_file}"
-        if additional_args:
-            command += f" {additional_args}"
-        command += f" {binary}"
-
-        result = execute_command(command, log_as=f"UPX {action} {binary}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
-
-
-# ============================================================================
-# MEMORY FORENSICS
-# ============================================================================
-
-@app.route("/api/tools/volatility", methods=["POST"])
-def volatility():
-    """Execute Volatility for memory forensics"""
-    try:
-        params = request.json
-        memory_file = params.get("memory_file", "")
-        plugin = params.get("plugin", "")
-        profile = params.get("profile", "")
-        additional_args = params.get("additional_args", "")
-
-        if not memory_file:
-            return jsonify({"error": "Memory file parameter is required"}), 400
-        if not plugin:
-            return jsonify({"error": "Plugin parameter is required"}), 400
-
-        command = f"volatility -f {memory_file}"
-        if profile:
-            command += f" --profile={profile}"
-        command += f" {plugin}"
-        if additional_args:
-            command += f" {additional_args}"
-
-        result = execute_command(command, log_as=f"Volatility {plugin} {memory_file}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
-
-
-@app.route("/api/tools/volatility3", methods=["POST"])
-def volatility3():
-    """Execute Volatility3 for advanced memory forensics"""
-    try:
-        params = request.json
-        memory_file = params.get("memory_file", "")
-        plugin = params.get("plugin", "")
-        output_file = params.get("output_file", "")
-        additional_args = params.get("additional_args", "")
-
-        if not memory_file:
-            return jsonify({"error": "Memory file parameter is required"}), 400
-        if not plugin:
-            return jsonify({"error": "Plugin parameter is required"}), 400
-
-        command = f"vol -f {memory_file} {plugin}"
-        if output_file:
-            command += f" > {output_file}"
-        if additional_args:
-            command += f" {additional_args}"
-
-        result = execute_command(command, log_as=f"Volatility3 {plugin} {memory_file}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
-
-
-# ============================================================================
-# PAYLOAD GENERATION
-# ============================================================================
-
-@app.route("/api/tools/msfvenom", methods=["POST"])
-def msfvenom():
-    """Execute MSFVenom for payload generation"""
-    try:
-        params = request.json
-        payload = params.get("payload", "")
-        format_type = params.get("format", "")
-        output_file = params.get("output_file", "")
-        encoder = params.get("encoder", "")
-        iterations = params.get("iterations", "")
-        lhost = params.get("lhost", "")
-        lport = params.get("lport", "")
-        additional_args = params.get("additional_args", "")
-
-        if not payload:
-            return jsonify({"error": "Payload parameter is required"}), 400
-
-        command = f"msfvenom -p {payload}"
-        if lhost:
-            command += f" LHOST={lhost}"
-        if lport:
-            command += f" LPORT={lport}"
-        if format_type:
-            command += f" -f {format_type}"
-        if output_file:
-            command += f" -o {output_file}"
-        if encoder:
-            command += f" -e {encoder}"
-        if iterations:
-            command += f" -i {iterations}"
-        if additional_args:
-            command += f" {additional_args}"
-
-        result = execute_command(command, log_as=f"MSFVenom {payload}")
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    command = f"pwninit --bin {params['binary']}"
+    if params.get("libc"):
+        command += f" --libc {params['libc']}"
+    if params.get("ld"):
+        command += f" --ld {params['ld']}"
+    if params.get("template_type"):
+        command += f" --template-type {params['template_type']}"
+    if params.get("additional_args"):
+        command += f" {params['additional_args']}"
+    return execute_command(command)
 
 
 # ============================================================================

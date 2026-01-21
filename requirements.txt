@@ -14,6 +14,7 @@ requests>=2.31.0,<3.0.0         # HTTP library for API calls
 psutil>=5.9.0,<6.0.0            # System utilities for process management
 fastmcp>=0.2.0,<1.0.0           # MCP framework for AI agent communication
 aiohttp>=3.8.0,<4.0.0           # Async HTTP support
+schema>=0.7.0,<1.0.0            # Data validation library
 
 # ============================================================================
 # BINARY ANALYSIS & EXPLOITATION LIBRARIES
@@ -45,15 +46,6 @@ bcrypt==4.0.1                   # Pin bcrypt version for passlib compatibility
 # - one_gadget - Find one-shot RCE gadgets in libc
 # - libc-database - Libc identification and offset lookup
 # - pwninit - Automate binary exploitation setup
-#
-# Memory Forensics:
-# - volatility, volatility3 - Memory forensics framework
-#
-# Payload Generation:
-# - msfvenom - Metasploit payload generator
-#
-# Packers:
-# - upx - Executable packer/unpacker
 #
 # Installation Notes:
 # 1. Kali Linux 2024.1+ includes most tools by default
