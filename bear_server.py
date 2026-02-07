@@ -549,17 +549,19 @@ class EnhancedCommandExecutor:
 
     def _read_stdout(self):
         try:
-            for line in iter(self.process.stdout.readline, ''):
-                if line:
-                    self.stdout_data += line
+            if self.process is not None and self.process.stdout is not None:
+                for line in iter(self.process.stdout.readline, ''):
+                    if line:
+                        self.stdout_data += line
         except Exception:
             pass
 
     def _read_stderr(self):
         try:
-            for line in iter(self.process.stderr.readline, ''):
-                if line:
-                    self.stderr_data += line
+            if self.process is not None and self.process.stderr is not None:
+                for line in iter(self.process.stderr.readline, ''):
+                    if line:
+                        self.stderr_data += line
         except Exception:
             pass
 
@@ -834,7 +836,7 @@ def find_ghidra_headless():
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
-    logger.info("Performing health check...")
+    logger.debug("Performing health check...")
 
     binary_tools = [
         "gdb", "radare2", "binwalk", "ropgadget", "checksec", "objdump",
@@ -844,7 +846,7 @@ def health_check():
 
     tools_status = {}
     for tool in binary_tools:
-        logger.info(f"Checking tool: {tool}")
+        logger.debug(f"Checking tool: {tool}")
         try:
             result = execute_command(f"which {tool}", use_cache=True)
             tools_status[tool] = result["success"]
@@ -852,7 +854,7 @@ def health_check():
             tools_status[tool] = False
 
     # Check Ghidra separately using find_ghidra_headless
-    logger.info("Checking tool: ghidra")
+    logger.debug("Checking tool: ghidra")
     tools_status["ghidra"] = find_ghidra_headless() is not None
 
     available_count = sum(1 for available in tools_status.values() if available)
@@ -957,6 +959,7 @@ def generate_payload():
             for i in range(size):
                 content += chars[i % len(chars)]
         elif payload_type == "random":
+            import string
             import random
             content = ''.join(random.choices(string.ascii_letters + string.digits, k=size))
         else:
@@ -1606,16 +1609,15 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=API_PORT, help=f"Port (default: {API_PORT})")
     args = parser.parse_args()
 
-    if args.debug:
-        DEBUG_MODE = True
+    debug_mode = DEBUG_MODE or args.debug
+    port = args.port if args.port != API_PORT else API_PORT
+
+    if debug_mode:
         logger.setLevel(logging.DEBUG)
 
-    if args.port != API_PORT:
-        API_PORT = args.port
-
-    logger.info(f"Starting BEAR Server on port {API_PORT}")
-    logger.info(f"Debug mode: {DEBUG_MODE}")
+    logger.info(f"Starting BEAR Server on port {port}")
+    logger.info(f"Debug mode: {debug_mode}")
     logger.info(f"Cache size: {CACHE_SIZE} | TTL: {CACHE_TTL}s")
     logger.info(f"Command timeout: {COMMAND_TIMEOUT}s")
 
-    app.run(host="0.0.0.0", port=API_PORT, debug=DEBUG_MODE)
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)
