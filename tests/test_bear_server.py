@@ -341,5 +341,122 @@ class TestOneGadgetEndpoints:
         assert response.status_code == 200
 
 
+
+class TestAsyncTasks:
+    """Tests for async task submission and polling endpoints"""
+
+    def test_list_tasks_empty(self, client):
+        """Test /api/tasks returns empty list when no tasks submitted"""
+        import bear_server
+        original = dict(bear_server.task_results)
+        bear_server.task_results.clear()
+        response = client.get('/api/tasks')
+        assert response.status_code == 200
+        data = json.loads(response.data)
+        assert data['success'] is True
+        assert data['total'] == 0
+        assert data['tasks'] == []
+        bear_server.task_results.update(original)
+
+    def test_get_task_not_found(self, client):
+        """Test GET /api/tasks/<task_id> returns 404 for unknown task"""
+        response = client.get('/api/tasks/nonexistent_task_id')
+        assert response.status_code == 404
+        data = json.loads(response.data)
+        assert 'error' in data
+
+    def test_cancel_task_not_found(self, client):
+        """Test DELETE /api/tasks/<task_id> returns 404 for unknown task"""
+        response = client.delete('/api/tasks/nonexistent_task_id')
+        assert response.status_code == 404
+        data = json.loads(response.data)
+        assert 'error' in data
+
+    def test_angr_async_submit(self, client):
+        """Test angr with async_mode=True returns task_id immediately"""
+        with patch('bear_server.run_async_task') as mock_async, \
+             patch('os.path.exists', return_value=True), \
+             patch('builtins.open', create=True) as mock_open:
+            mock_open.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_open.return_value.__exit__ = MagicMock(return_value=False)
+            response = client.post('/api/tools/angr',
+                                   json={'binary': '/bin/ls', 'async_mode': True},
+                                   content_type='application/json')
+            assert response.status_code == 200
+            data = json.loads(response.data)
+            assert data['success'] is True
+            assert data['async'] is True
+            assert 'task_id' in data
+            assert data['status'] == 'queued'
+            assert data['task_id'].startswith('angr_')
+            mock_async.assert_called_once()
+
+    def test_get_task_queued(self, client):
+        """Test GET /api/tasks/<task_id> returns queued status"""
+        import bear_server
+        task_id = 'test_task_queued_123'
+        bear_server.task_results[task_id] = {
+            'task_id': task_id, 'status': 'queued',
+            'submitted_at': 1000.0, 'started_at': None,
+            'completed_at': None, 'command': 'python3 /tmp/test.py', 'result': None,
+        }
+        response = client.get(f'/api/tasks/{task_id}')
+        assert response.status_code == 200
+        data = json.loads(response.data)
+        assert data['task_id'] == task_id
+        assert data['status'] == 'queued'
+        assert 'result' not in data
+        del bear_server.task_results[task_id]
+
+    def test_get_task_completed(self, client):
+        """Test GET /api/tasks/<task_id> returns result when completed"""
+        import bear_server
+        task_id = 'test_task_done_456'
+        bear_server.task_results[task_id] = {
+            'task_id': task_id, 'status': 'completed',
+            'submitted_at': 1000.0, 'started_at': 1001.0, 'completed_at': 1060.0,
+            'command': 'python3 /tmp/angr_analysis.py',
+            'result': {'success': True, 'stdout': 'done', 'execution_time': 59.0},
+        }
+        response = client.get(f'/api/tasks/{task_id}')
+        assert response.status_code == 200
+        data = json.loads(response.data)
+        assert data['status'] == 'completed'
+        assert data['result']['success'] is True
+        del bear_server.task_results[task_id]
+
+    def test_cancel_completed_task_fails(self, client):
+        """Test that cancelling a completed task returns 400"""
+        import bear_server
+        task_id = 'test_task_cancel_789'
+        bear_server.task_results[task_id] = {
+            'task_id': task_id, 'status': 'completed',
+            'submitted_at': 1000.0, 'started_at': 1001.0, 'completed_at': 1060.0,
+            'command': 'python3 /tmp/test.py', 'result': {'success': True},
+        }
+        response = client.delete(f'/api/tasks/{task_id}')
+        assert response.status_code == 400
+        data = json.loads(response.data)
+        assert data['success'] is False
+        del bear_server.task_results[task_id]
+
+    def test_list_tasks_with_entries(self, client):
+        """Test /api/tasks lists all submitted tasks"""
+        import bear_server
+        task_id = 'test_list_task_abc'
+        bear_server.task_results[task_id] = {
+            'task_id': task_id, 'status': 'running',
+            'submitted_at': 1000.0, 'started_at': 1001.0,
+            'completed_at': None, 'command': 'python3 /tmp/angr.py', 'result': None,
+        }
+        response = client.get('/api/tasks')
+        assert response.status_code == 200
+        data = json.loads(response.data)
+        assert data['success'] is True
+        task_ids = [t['task_id'] for t in data['tasks']]
+        assert task_id in task_ids
+        del bear_server.task_results[task_id]
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

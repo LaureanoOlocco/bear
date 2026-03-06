@@ -89,6 +89,10 @@ CACHE_TTL = int(os.environ.get('BEAR_CACHE_TTL', 3600))
 active_processes: Dict[int, Dict[str, Any]] = {}
 process_lock = threading.Lock()
 
+# Async task tracking
+task_results: Dict[str, Any] = {}
+task_lock = threading.Lock()
+
 
 # ============================================================================
 # SCHEMA VALIDATION & ENDPOINT DECORATOR
@@ -222,7 +226,8 @@ SCHEMAS = {
     "ghidra": Schema({
         "binary": And(str, len),
         Opt("function"): str,
-        Opt("timeout"): int
+        Opt("timeout"): int,
+        Opt("async_mode"): bool
     }),
     "pwntools": Schema({
         Opt("script_content"): str,
@@ -238,7 +243,8 @@ SCHEMAS = {
         Opt("analysis_type"): str,
         Opt("find_address"): str,
         Opt("avoid_addresses"): str,
-        Opt("additional_args"): str
+        Opt("additional_args"): str,
+        Opt("async_mode"): bool
     }),
     "libc_database": Schema({
         Opt("action"): str,
@@ -655,6 +661,50 @@ def execute_command(command: str, use_cache: bool = True, timeout: int = COMMAND
 
     return result
 
+
+
+def run_async_task(task_id: str, command: str, timeout: int, cleanup_file: Optional[str] = None) -> None:
+    """Submit a command to run in a background thread and store result in task_results.
+
+    Args:
+        task_id: Unique identifier for this task
+        command: Shell command to execute
+        timeout: Execution timeout in seconds
+        cleanup_file: Optional temp file to remove after execution
+    """
+    def _run():
+        with task_lock:
+            task_results[task_id]["status"] = "running"
+            task_results[task_id]["started_at"] = time.time()
+
+        result = execute_command(command, use_cache=False, timeout=timeout)
+
+        if cleanup_file:
+            cleanup_temp_file(cleanup_file)
+
+        status = "completed" if result.get("success") else "failed"
+        with task_lock:
+            task_results[task_id].update({
+                "status": status,
+                "result": result,
+                "completed_at": time.time(),
+            })
+        logger.info(f"[ASYNC] Task {task_id} {status} in {result.get('execution_time', 0):.1f}s")
+
+    with task_lock:
+        task_results[task_id] = {
+            "task_id": task_id,
+            "status": "queued",
+            "submitted_at": time.time(),
+            "started_at": None,
+            "completed_at": None,
+            "command": command,
+            "result": None,
+        }
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    logger.info(f"[ASYNC] Task {task_id} submitted")
 
 # ============================================================================
 # FILE OPERATIONS MANAGER
@@ -1216,6 +1266,7 @@ def ghidra_decompile(params):
     binary = params["binary"]
     function_name = params.get("function", "all")
     analysis_timeout = params.get("timeout", 300)
+    async_mode = params.get("async_mode", False)
 
     if not os.path.exists(binary):
         raise ValueError(f"Binary not found: {binary}")
@@ -1234,6 +1285,18 @@ def ghidra_decompile(params):
     os.makedirs(project_dir, exist_ok=True)
 
     command = f'"{ghidra_headless}" "{project_dir}" decompile_project -import "{binary}" -scriptPath "{script_dir}" -postScript {decompile_script} "{function_name}" -deleteProject'
+
+    if async_mode:
+        task_id = f"ghidra_{int(time.time() * 1000)}"
+        run_async_task(task_id, command, analysis_timeout)
+        return {
+            "success": True,
+            "async": True,
+            "task_id": task_id,
+            "status": "queued",
+            "message": f"Ghidra decompilation submitted. Poll GET /api/tasks/{task_id} for results.",
+        }
+
     result = execute_command(command, timeout=analysis_timeout)
 
     if result.get("success") and result.get("stdout"):
@@ -1499,6 +1562,7 @@ def angr(params):
     find_address = params.get("find_address", "")
     avoid_addresses = params.get("avoid_addresses", "")
     analysis_type = params.get("analysis_type", "symbolic")
+    async_mode = params.get("async_mode", False)
 
     script_file = "/tmp/angr_analysis.py"
 
@@ -1543,6 +1607,17 @@ for func_addr, func in list(cfg.functions.items())[:10]:
     command = f"python3 {script_file}"
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
+
+    if async_mode:
+        task_id = f"angr_{int(time.time() * 1000)}"
+        run_async_task(task_id, command, timeout=600, cleanup_file=script_file)
+        return {
+            "success": True,
+            "async": True,
+            "task_id": task_id,
+            "status": "queued",
+            "message": f"Angr analysis submitted. Poll GET /api/tasks/{task_id} for results.",
+        }
 
     result = execute_command(command, timeout=600)
     cleanup_temp_file(script_file)
@@ -1593,6 +1668,77 @@ def pwninit(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
     return execute_command(command)
+
+
+# ============================================================================
+# API ROUTES - ASYNC TASKS
+# ============================================================================
+
+@app.route("/api/tasks", methods=["GET"])
+def list_tasks():
+    """List all async tasks and their current status"""
+    with task_lock:
+        tasks = []
+        for task_id, info in task_results.items():
+            entry = {
+                "task_id": task_id,
+                "status": info["status"],
+                "submitted_at": info["submitted_at"],
+                "started_at": info["started_at"],
+                "completed_at": info["completed_at"],
+                "command": info["command"],
+            }
+            if info["status"] == "running" and info["started_at"]:
+                entry["runtime_seconds"] = round(time.time() - info["started_at"], 1)
+            tasks.append(entry)
+    return jsonify({"success": True, "total": len(tasks), "tasks": tasks})
+
+
+@app.route("/api/tasks/<task_id>", methods=["GET"])
+def get_task(task_id):
+    """Get the status and result of a specific async task"""
+    with task_lock:
+        info = task_results.get(task_id)
+    if info is None:
+        return jsonify({"error": f"Task not found: {task_id}"}), 404
+    response = {
+        "task_id": task_id,
+        "status": info["status"],
+        "submitted_at": info["submitted_at"],
+        "started_at": info["started_at"],
+        "completed_at": info["completed_at"],
+    }
+    if info["status"] == "running" and info["started_at"]:
+        response["runtime_seconds"] = round(time.time() - info["started_at"], 1)
+    if info["status"] in ("completed", "failed") and info["result"] is not None:
+        response["result"] = info["result"]
+    return jsonify(response)
+
+
+@app.route("/api/tasks/<task_id>", methods=["DELETE"])
+def cancel_task(task_id):
+    """Cancel a queued or running async task"""
+    with task_lock:
+        info = task_results.get(task_id)
+    if info is None:
+        return jsonify({"error": f"Task not found: {task_id}"}), 404
+    status = info["status"]
+    if status in ("completed", "failed"):
+        return jsonify({"success": False, "task_id": task_id, "error": f"Task already {status}, cannot cancel"}), 400
+    cancelled = False
+    with task_lock:
+        processes_snapshot = dict(active_processes)
+    command = info.get("command", "")
+    for pid, proc_info in processes_snapshot.items():
+        if proc_info.get("command") == command:
+            cancelled = ProcessManager.terminate_process(pid)
+            break
+    with task_lock:
+        if task_id in task_results:
+            task_results[task_id]["status"] = "cancelled"
+            task_results[task_id]["completed_at"] = time.time()
+    logger.info(f"[ASYNC] Task {task_id} cancelled (process terminated: {cancelled})")
+    return jsonify({"success": True, "task_id": task_id, "status": "cancelled", "process_terminated": cancelled})
 
 
 # ============================================================================

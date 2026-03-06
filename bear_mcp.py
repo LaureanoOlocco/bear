@@ -182,6 +182,19 @@ class BearClient:
             logger.error(f"Unexpected error: {str(e)}")
             return {"error": f"Unexpected error: {str(e)}", "success": False}
 
+    def safe_delete(self, endpoint: str) -> Dict[str, Any]:
+        url = f"{self.server_url}/{endpoint}"
+        try:
+            response = self.session.delete(url, timeout=self.timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed: {str(e)}")
+            return {"error": f"Request failed: {str(e)}", "success": False}
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
+            return {"error": f"Unexpected error: {str(e)}", "success": False}
+
     def execute_command(self, command: str, use_cache: bool = True) -> Dict[str, Any]:
         return self.safe_post("api/command", {"command": command, "use_cache": use_cache})
 
@@ -315,7 +328,8 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def ghidra_decompile(binary: str, function: str = "all", timeout: int = 300) -> Dict[str, Any]:
+    def ghidra_decompile(binary: str, function: str = "all", timeout: int = 300,
+                         async_mode: bool = False) -> Dict[str, Any]:
         """
         Decompile a binary using Ghidra and return C-like pseudocode.
 
@@ -326,19 +340,25 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
                       - function name (e.g., "main", "vulnerable_func")
                       - address (e.g., "0x401000")
             timeout: Analysis timeout in seconds (default 300)
+            async_mode: If True, submit as background task and return task_id immediately.
+                        Use get_task_status(task_id) to poll for results.
 
         Returns:
-            Decompiled C-like pseudocode for the specified function(s)
+            Decompiled C-like pseudocode, or task submission info if async_mode=True
         """
         data = {
             "binary": binary,
             "function": function,
-            "timeout": timeout
+            "timeout": timeout,
+            "async_mode": async_mode
         }
-        logger.info(f"Starting Ghidra decompilation: {binary} function={function}")
+        logger.info(f"Starting Ghidra decompilation: {binary} function={function} async={async_mode}")
         result = bear_client.safe_post("api/tools/ghidra/decompile", data)
         if result.get("success"):
-            logger.info(f"Ghidra decompilation completed for {binary}")
+            if async_mode:
+                logger.info(f"Ghidra task submitted: {result.get('task_id')}")
+            else:
+                logger.info(f"Ghidra decompilation completed for {binary}")
         else:
             logger.error(f"Ghidra decompilation failed for {binary}")
         return result
@@ -679,7 +699,8 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
     @mcp.tool()
     def angr_symbolic_execution(binary: str, script_content: str = "",
                                find_address: str = "", avoid_addresses: str = "",
-                               analysis_type: str = "symbolic", additional_args: str = "") -> Dict[str, Any]:
+                               analysis_type: str = "symbolic", additional_args: str = "",
+                               async_mode: bool = False) -> Dict[str, Any]:
         """
         Execute angr for symbolic execution and binary analysis.
 
@@ -690,9 +711,12 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
             avoid_addresses: Comma-separated addresses to avoid (hex)
             analysis_type: Type of analysis (symbolic, cfg, static)
             additional_args: Additional arguments
+            async_mode: If True, submit as background task and return task_id immediately.
+                        Use get_task_status(task_id) to poll for results. Recommended
+                        for large binaries or long-running symbolic execution.
 
         Returns:
-            Symbolic execution and binary analysis results
+            Symbolic execution results, or task submission info if async_mode=True
         """
         data = {
             "binary": binary,
@@ -700,14 +724,18 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
             "find_address": find_address,
             "avoid_addresses": avoid_addresses,
             "analysis_type": analysis_type,
-            "additional_args": additional_args
+            "additional_args": additional_args,
+            "async_mode": async_mode
         }
-        logger.info(f"Starting angr analysis: {binary}")
+        logger.info(f"Starting angr analysis: {binary} async={async_mode}")
         result = bear_client.safe_post("api/tools/angr", data)
         if result.get("success"):
-            logger.info(f"angr analysis completed")
+            if async_mode:
+                logger.info(f"Angr task submitted: {result.get('task_id')}")
+            else:
+                logger.info(f"Angr analysis completed")
         else:
-            logger.error(f"angr analysis failed")
+            logger.error(f"Angr analysis failed")
         return result
 
     @mcp.tool()
@@ -1168,6 +1196,68 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
             logger.info(f"Dashboard retrieved: {total} active processes")
         else:
             logger.error("Failed to get process dashboard")
+        return result
+
+
+    # ============================================================================
+    # ASYNC TASK MANAGEMENT
+    # ============================================================================
+
+    @mcp.tool()
+    def get_task_status(task_id: str) -> Dict[str, Any]:
+        """
+        Poll the status of an async task (angr or Ghidra submitted with async_mode=True).
+
+        Status values: queued / running / completed / failed / cancelled
+
+        Args:
+            task_id: Task ID returned when async_mode=True was used
+
+        Returns:
+            Task status and result (when completed or failed)
+        """
+        logger.info(f"Polling task status: {task_id}")
+        result = bear_client.safe_get(f"api/tasks/{task_id}")
+        status = result.get("status", "unknown")
+        if status in ("completed", "failed"):
+            runtime = result.get("result", {}).get("execution_time", 0)
+            logger.info(f"Task {task_id} {status} (execution_time={runtime:.1f}s)")
+        elif status == "running":
+            logger.info(f"Task {task_id} still running ({result.get('runtime_seconds', 0)}s elapsed)")
+        else:
+            logger.info(f"Task {task_id} status: {status}")
+        return result
+
+    @mcp.tool()
+    def list_async_tasks() -> Dict[str, Any]:
+        """
+        List all async tasks and their current status.
+
+        Returns:
+            All tasks with status, submission time, and runtime info
+        """
+        logger.info("Listing async tasks")
+        result = bear_client.safe_get("api/tasks")
+        logger.info(f"Found {result.get('total', 0)} async task(s)")
+        return result
+
+    @mcp.tool()
+    def cancel_async_task(task_id: str) -> Dict[str, Any]:
+        """
+        Cancel a queued or running async task.
+
+        Args:
+            task_id: Task ID to cancel
+
+        Returns:
+            Cancellation result
+        """
+        logger.info(f"Cancelling task: {task_id}")
+        result = bear_client.safe_delete(f"api/tasks/{task_id}")
+        if result.get("success"):
+            logger.info(f"Task {task_id} cancelled")
+        else:
+            logger.error(f"Failed to cancel task {task_id}: {result.get('error', '')}")
         return result
 
     return mcp
