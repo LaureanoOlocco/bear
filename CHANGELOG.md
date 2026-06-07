@@ -2,6 +2,35 @@
 
 All notable changes to BEAR will be documented in this file.
 
+## [1.4.0] - 2026-06-06
+
+### Added
+- `uv` project configuration via `pyproject.toml`
+- Disk-backed command cache using `diskcache`
+- Ghidra disassembly endpoint and MCP tool
+- `disassemble_binary` MCP tool that prefers Ghidra and falls back to objdump
+- Shared `bear_ui.py` module for colors, log formatting, and banner rendering
+- `triage_binary` API/MCP tool for quick static binary triage
+- `ghidra_functions` API/MCP tool for function listing
+- `ghidra_xrefs` API/MCP tool for cross-reference lookup
+- `ghidra_callgraph` API/MCP tool for call graph generation
+- Shared Ghidra inspection script: `InspectBinary.java`
+
+### Changed
+- MCP server now imports FastMCP from the standalone `fastmcp` package
+- README and MCP config now use `uv run`
+- Migrated the API backend from Flask to FastAPI
+- Replaced `schema` validation with Pydantic request models
+- Updated the server entry point to run with uvicorn
+- Migrated API tests from Flask's test client to FastAPI `TestClient`
+- Ghidra inspection tools share the same backend execution/parser path
+
+### Removed
+- `requirements.txt`
+- angr dependency, server endpoint, MCP tool, and tests
+- Flask dependency
+- `schema` dependency
+
 ## [1.3.0] - 2026-01-21
 
 ### Added

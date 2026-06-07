@@ -16,7 +16,6 @@ TOOLS AVAILABLE (25+):
 - Strings, Objdump, Readelf - Binary inspection tools
 - XXD, Hexdump - Hex dump utilities
 - Pwntools - CTF framework and exploit development library
-- Angr - Binary analysis platform with symbolic execution
 - Libc-Database - Libc identification and offset lookup
 - Pwninit - Automate binary exploitation setup
 
@@ -25,78 +24,15 @@ Framework: FastMCP integration for tool orchestration
 """
 
 import sys
-import os
 import argparse
 import logging
 from typing import Dict, Any, Optional
 import requests
 import time
-from datetime import datetime
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
-class BearColors:
-    """Enhanced color palette for terminal output"""
-
-    # Basic colors
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    MAGENTA = '\033[95m'
-    CYAN = '\033[96m'
-    WHITE = '\033[97m'
-
-    # Core enhanced colors
-    MATRIX_GREEN = '\033[38;5;46m'
-    NEON_BLUE = '\033[38;5;51m'
-    ELECTRIC_PURPLE = '\033[38;5;129m'
-    CYBER_ORANGE = '\033[38;5;208m'
-    HACKER_RED = '\033[38;5;196m'
-    TERMINAL_GRAY = '\033[38;5;240m'
-    BRIGHT_WHITE = '\033[97m'
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-    DIM = '\033[2m'
-
-    # Reddish tones
-    BLOOD_RED = '\033[38;5;124m'
-    CRIMSON = '\033[38;5;160m'
-    DARK_RED = '\033[38;5;88m'
-    FIRE_RED = '\033[38;5;202m'
-    RUBY = '\033[38;5;161m'
-
-    # Status colors
-    SUCCESS = '\033[38;5;46m'
-    WARNING = '\033[38;5;208m'
-    ERROR = '\033[38;5;196m'
-    CRITICAL = '\033[48;5;196m\033[38;5;15m\033[1m'
-    INFO = '\033[38;5;51m'
-    DEBUG = '\033[38;5;240m'
-
-    # Tool status colors
-    TOOL_RUNNING = '\033[38;5;46m\033[5m'
-    TOOL_SUCCESS = '\033[38;5;46m\033[1m'
-    TOOL_FAILED = '\033[38;5;196m\033[1m'
-
-# Backward compatibility alias
-Colors = BearColors
-
-class ColoredFormatter(logging.Formatter):
-    """Enhanced formatter with colors"""
-
-    COLORS = {
-        'DEBUG': BearColors.DEBUG,
-        'INFO': BearColors.SUCCESS,
-        'WARNING': BearColors.WARNING,
-        'ERROR': BearColors.ERROR,
-        'CRITICAL': BearColors.CRITICAL
-    }
-
-    def format(self, record):
-        color = self.COLORS.get(record.levelname, BearColors.BRIGHT_WHITE)
-        record.msg = f"{color}{record.msg}{BearColors.RESET}"
-        return super().format(record)
+from bear_ui import ColoredFormatter
 
 # Setup logging
 logging.basicConfig(
@@ -116,7 +52,7 @@ for handler in logging.getLogger().handlers:
 logger = logging.getLogger(__name__)
 
 # Default configuration
-VERSION = "1.2.0"
+VERSION = "1.4.0"
 DEFAULT_BEAR_SERVER = "http://127.0.0.1:8888"
 DEFAULT_REQUEST_TIMEOUT = 300
 MAX_RETRIES = 3
@@ -328,6 +264,32 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
         return result
 
     @mcp.tool()
+    def triage_binary(binary: str, strings_limit: int = 40, use_cache: bool = True) -> Dict[str, Any]:
+        """
+        Run quick binary triage: file type, SHA256, checksec, ELF headers, symbols, and strings.
+
+        Args:
+            binary: Path to the binary file
+            strings_limit: Maximum number of strings to include
+            use_cache: Whether to use server-side command cache
+
+        Returns:
+            Triage summary and command outputs
+        """
+        data = {
+            "binary": binary,
+            "strings_limit": strings_limit,
+            "use_cache": use_cache,
+        }
+        logger.info(f"Starting binary triage: {binary}")
+        result = bear_client.safe_post("api/tools/triage", data)
+        if result.get("success"):
+            logger.info(f"Binary triage completed for {binary}")
+        else:
+            logger.error(f"Binary triage failed for {binary}")
+        return result
+
+    @mcp.tool()
     def ghidra_decompile(binary: str, function: str = "all", timeout: int = 300,
                          async_mode: bool = False) -> Dict[str, Any]:
         """
@@ -361,6 +323,128 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
                 logger.info(f"Ghidra decompilation completed for {binary}")
         else:
             logger.error(f"Ghidra decompilation failed for {binary}")
+        return result
+
+    @mcp.tool()
+    def ghidra_disassemble(binary: str, function: str = "all", timeout: int = 300,
+                           async_mode: bool = False) -> Dict[str, Any]:
+        """
+        Disassemble a binary using Ghidra and return structured instructions.
+
+        Args:
+            binary: Path to the binary file to disassemble
+            function: Function to disassemble, address, or "all"
+            timeout: Analysis timeout in seconds (default 300)
+            async_mode: If True, submit as background task and return task_id immediately.
+
+        Returns:
+            Structured Ghidra disassembly, or task submission info if async_mode=True
+        """
+        data = {
+            "binary": binary,
+            "function": function,
+            "timeout": timeout,
+            "async_mode": async_mode
+        }
+        logger.info(f"Starting Ghidra disassembly: {binary} function={function} async={async_mode}")
+        result = bear_client.safe_post("api/tools/ghidra/disassemble", data)
+        if result.get("success"):
+            if async_mode:
+                logger.info(f"Ghidra disassembly task submitted: {result.get('task_id')}")
+            else:
+                logger.info(f"Ghidra disassembly completed for {binary}")
+        else:
+            logger.error(f"Ghidra disassembly failed for {binary}")
+        return result
+
+    @mcp.tool()
+    def ghidra_functions(binary: str, timeout: int = 300, async_mode: bool = False) -> Dict[str, Any]:
+        """
+        List functions discovered by Ghidra with addresses, signatures, namespaces, and sizes.
+
+        Args:
+            binary: Path to the binary file
+            timeout: Analysis timeout in seconds
+            async_mode: If True, submit as background task and return task_id immediately.
+
+        Returns:
+            Structured function list from Ghidra
+        """
+        data = {"binary": binary, "timeout": timeout, "async_mode": async_mode}
+        logger.info(f"Listing Ghidra functions: {binary} async={async_mode}")
+        result = bear_client.safe_post("api/tools/ghidra/functions", data)
+        if result.get("success"):
+            logger.info(f"Ghidra function listing completed for {binary}")
+        else:
+            logger.error(f"Ghidra function listing failed for {binary}")
+        return result
+
+    @mcp.tool()
+    def ghidra_xrefs(binary: str, target: str, direction: str = "both",
+                     target_type: str = "auto", timeout: int = 300,
+                     async_mode: bool = False) -> Dict[str, Any]:
+        """
+        Find Ghidra cross-references to/from a function, symbol, string, or address.
+
+        Args:
+            binary: Path to the binary file
+            target: Function name, symbol, string, or address to inspect
+            direction: to, from, or both
+            target_type: auto, function, address, string, or symbol
+            timeout: Analysis timeout in seconds
+            async_mode: If True, submit as background task and return task_id immediately.
+
+        Returns:
+            Structured xrefs_to and xrefs_from results
+        """
+        data = {
+            "binary": binary,
+            "target": target,
+            "direction": direction,
+            "target_type": target_type,
+            "timeout": timeout,
+            "async_mode": async_mode,
+        }
+        logger.info(f"Finding Ghidra xrefs: {binary} target={target} direction={direction}")
+        result = bear_client.safe_post("api/tools/ghidra/xrefs", data)
+        if result.get("success"):
+            logger.info(f"Ghidra xrefs completed for {target}")
+        else:
+            logger.error(f"Ghidra xrefs failed for {target}")
+        return result
+
+    @mcp.tool()
+    def ghidra_callgraph(binary: str, function: str = "all", direction: str = "out",
+                         depth: int = 2, timeout: int = 300,
+                         async_mode: bool = False) -> Dict[str, Any]:
+        """
+        Build a Ghidra call graph for all functions or a selected root function/address.
+
+        Args:
+            binary: Path to the binary file
+            function: Function name/address root, or all
+            direction: out, in, or both
+            depth: Recursion depth, 1-10
+            timeout: Analysis timeout in seconds
+            async_mode: If True, submit as background task and return task_id immediately.
+
+        Returns:
+            Structured call graph adjacency map
+        """
+        data = {
+            "binary": binary,
+            "function": function,
+            "direction": direction,
+            "depth": depth,
+            "timeout": timeout,
+            "async_mode": async_mode,
+        }
+        logger.info(f"Building Ghidra callgraph: {binary} function={function} depth={depth}")
+        result = bear_client.safe_post("api/tools/ghidra/callgraph", data)
+        if result.get("success"):
+            logger.info(f"Ghidra callgraph completed for {binary}")
+        else:
+            logger.error(f"Ghidra callgraph failed for {binary}")
         return result
 
     @mcp.tool()
@@ -469,6 +553,42 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
         else:
             logger.error(f"Objdump analysis failed for {binary}")
         return result
+
+    @mcp.tool()
+    def disassemble_binary(binary: str, function: str = "all", backend: str = "auto",
+                           timeout: int = 300) -> Dict[str, Any]:
+        """
+        Disassemble a binary, preferring Ghidra and falling back to objdump.
+
+        Args:
+            binary: Path to the binary file
+            function: Function name/address for Ghidra; ignored by objdump fallback
+            backend: auto, ghidra, or objdump
+            timeout: Ghidra analysis timeout in seconds
+
+        Returns:
+            Disassembly result with the backend used
+        """
+        selected = backend.lower().strip()
+        if selected not in ("auto", "ghidra", "objdump"):
+            return {"success": False, "error": "backend must be auto, ghidra, or objdump"}
+
+        if selected in ("auto", "ghidra"):
+            ghidra_result = ghidra_disassemble(binary=binary, function=function, timeout=timeout)
+            if ghidra_result.get("success"):
+                ghidra_result["backend"] = "ghidra"
+                return ghidra_result
+            if selected == "ghidra":
+                ghidra_result["backend"] = "ghidra"
+                return ghidra_result
+            fallback_reason = ghidra_result.get("error", "Ghidra disassembly failed")
+        else:
+            fallback_reason = "backend=objdump requested"
+
+        objdump_result = objdump_analyze(binary=binary, disassemble=True)
+        objdump_result["backend"] = "objdump"
+        objdump_result["fallback_reason"] = fallback_reason
+        return objdump_result
 
     @mcp.tool()
     def readelf_analyze(binary: str, headers: bool = True, symbols: bool = False,
@@ -694,48 +814,6 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
             logger.info(f"Pwntools exploit completed")
         else:
             logger.error(f"Pwntools exploit failed")
-        return result
-
-    @mcp.tool()
-    def angr_symbolic_execution(binary: str, script_content: str = "",
-                               find_address: str = "", avoid_addresses: str = "",
-                               analysis_type: str = "symbolic", additional_args: str = "",
-                               async_mode: bool = False) -> Dict[str, Any]:
-        """
-        Execute angr for symbolic execution and binary analysis.
-
-        Args:
-            binary: Binary to analyze
-            script_content: Custom angr script content
-            find_address: Address to find during symbolic execution (hex)
-            avoid_addresses: Comma-separated addresses to avoid (hex)
-            analysis_type: Type of analysis (symbolic, cfg, static)
-            additional_args: Additional arguments
-            async_mode: If True, submit as background task and return task_id immediately.
-                        Use get_task_status(task_id) to poll for results. Recommended
-                        for large binaries or long-running symbolic execution.
-
-        Returns:
-            Symbolic execution results, or task submission info if async_mode=True
-        """
-        data = {
-            "binary": binary,
-            "script_content": script_content,
-            "find_address": find_address,
-            "avoid_addresses": avoid_addresses,
-            "analysis_type": analysis_type,
-            "additional_args": additional_args,
-            "async_mode": async_mode
-        }
-        logger.info(f"Starting angr analysis: {binary} async={async_mode}")
-        result = bear_client.safe_post("api/tools/angr", data)
-        if result.get("success"):
-            if async_mode:
-                logger.info(f"Angr task submitted: {result.get('task_id')}")
-            else:
-                logger.info(f"Angr analysis completed")
-        else:
-            logger.error(f"Angr analysis failed")
         return result
 
     @mcp.tool()
@@ -1206,7 +1284,7 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
     @mcp.tool()
     def get_task_status(task_id: str) -> Dict[str, Any]:
         """
-        Poll the status of an async task (angr or Ghidra submitted with async_mode=True).
+        Poll the status of an async task submitted with async_mode=True.
 
         Status values: queued / running / completed / failed / cancelled
 

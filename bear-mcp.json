@@ -1,13 +1,16 @@
 {
   "mcpServers": {
     "bear": {
-      "command": "python3",
+      "command": "uv",
       "args": [
-        "/path/bear_mcp.py",
+        "--directory",
+        "/path/to/bear",
+        "run",
+        "bear-mcp",
         "--server",
         "http://IPADDRESS:8888"
       ],
-      "description": "BEAR v1.0 - Binary Exploitation & Automated Reversing MCP Server",
+      "description": "BEAR v1.4 - Binary Exploitation & Automated Reversing MCP Server",
       "timeout": 300,
       "alwaysAllow": []
     }

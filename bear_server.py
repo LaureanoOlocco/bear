@@ -16,12 +16,11 @@ TOOLS AVAILABLE (25+):
 - Strings, Objdump, Readelf - Binary inspection tools
 - XXD, Hexdump - Hex dump utilities
 - Pwntools - CTF framework and exploit development library
-- Angr - Binary analysis platform with symbolic execution
 - Libc-Database - Libc identification and offset lookup
 - Pwninit - Automate binary exploitation setup
 
 Architecture: REST API backend for BEAR MCP client
-Framework: Flask with enhanced command execution and caching
+Framework: FastAPI with enhanced command execution and caching
 """
 
 import argparse
@@ -36,14 +35,47 @@ import hashlib
 import shutil
 import venv
 import signal
-from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, Any, Optional
 from pathlib import Path
-from flask import Flask, request, jsonify
-from functools import wraps
-from schema import Schema, And, Optional as Opt, SchemaError
+from diskcache import Cache as DiskCache
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 import psutil
+import uvicorn
+
+from bear_models import (
+    BinwalkRequest,
+    ChecksecRequest,
+    FileCreateRequest,
+    FileDeleteRequest,
+    FileModifyRequest,
+    GdbEnhancedRequest,
+    GdbRequest,
+    GhidraCallgraphRequest,
+    GhidraFunctionsRequest,
+    GenericCommandRequest,
+    GhidraRequest,
+    GhidraXrefsRequest,
+    HexdumpRequest,
+    LibcDatabaseRequest,
+    ObjdumpRequest,
+    OneGadgetRequest,
+    PayloadGenerateRequest,
+    PwntoolsRequest,
+    PythonExecuteRequest,
+    PythonInstallRequest,
+    Radare2Request,
+    ReadelfRequest,
+    RopgadgetRequest,
+    RopperRequest,
+    PwninitRequest,
+    StringsRequest,
+    TriageRequest,
+    XxdRequest,
+)
+from bear_ui import ModernVisualEngine
 
 # ============================================================================
 # LOGGING CONFIGURATION
@@ -68,22 +100,48 @@ except PermissionError:
     )
 
 logger = logging.getLogger(__name__)
-logging.getLogger('werkzeug').setLevel(logging.WARNING)
+logging.getLogger('uvicorn.access').setLevel(logging.WARNING)
 
-# Flask app configuration
-app = Flask(__name__)
-app.config['JSON_SORT_KEYS'] = False
+# FastAPI app configuration
+app = FastAPI(title="BEAR", version="1.4.0")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Return BEAR-style validation errors for API clients."""
+    return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    """Map validation ValueErrors to HTTP 400."""
+    return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Return BEAR-style error bodies for explicit HTTP errors."""
+    return JSONResponse(status_code=exc.status_code, content={"error": str(exc.detail)})
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """Return BEAR-style error bodies for unexpected server errors."""
+    logger.error(f"Unhandled API error: {exc}")
+    return JSONResponse(status_code=500, content={"error": f"Server error: {exc}"})
 
 # API Configuration
 API_PORT = int(os.environ.get('BEAR_PORT', 8888))
 API_HOST = os.environ.get('BEAR_HOST', '127.0.0.1')
 DEBUG_MODE = False
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # Command execution settings
 COMMAND_TIMEOUT = int(os.environ.get('BEAR_TIMEOUT', 300))
 CACHE_SIZE = int(os.environ.get('BEAR_CACHE_SIZE', 1000))
 CACHE_TTL = int(os.environ.get('BEAR_CACHE_TTL', 3600))
+CACHE_DIR = os.environ.get('BEAR_CACHE_DIR', '.bear_cache')
+CACHE_SIZE_LIMIT = int(os.environ.get('BEAR_CACHE_SIZE_LIMIT', 1024 * 1024 * 1024))
 
 # Global process management
 active_processes: Dict[int, Dict[str, Any]] = {}
@@ -92,34 +150,6 @@ process_lock = threading.Lock()
 # Async task tracking
 task_results: Dict[str, Any] = {}
 task_lock = threading.Lock()
-
-
-# ============================================================================
-# SCHEMA VALIDATION & ENDPOINT DECORATOR
-# ============================================================================
-
-def tool_endpoint(schema, tool_name, use_cache=False):
-    """Decorator for tool endpoints with schema validation and error handling"""
-    def decorator(func):
-        @wraps(func)
-        def wrapper():
-            try:
-                params = schema.validate(request.json or {})
-                target = params.get('binary', params.get('file_path', params.get('libc_path', 'input')))
-                logger.info(f"Running {tool_name} on {target}")
-                result = func(params)
-                return jsonify(result)
-            except SchemaError as e:
-                logger.warning(f"[TOOL] {tool_name} - Validation error: {str(e)}")
-                return jsonify({"error": str(e)}), 400
-            except ValueError as e:
-                logger.warning(f"[TOOL] {tool_name} - Validation error: {str(e)}")
-                return jsonify({"error": str(e)}), 400
-            except Exception as e:
-                logger.error(f"[TOOL] {tool_name} - Error: {str(e)}")
-                return jsonify({"error": f"Server error: {str(e)}"}), 500
-        return wrapper
-    return decorator
 
 
 def cleanup_temp_file(filepath):
@@ -131,261 +161,95 @@ def cleanup_temp_file(filepath):
             pass
 
 
-# Tool Schemas
-SCHEMAS = {
-    "checksec": Schema({
-        "binary": And(str, len)
-    }),
-    "strings": Schema({
-        "file_path": And(str, len),
-        Opt("min_len"): int,
-        Opt("encoding"): str,
-        Opt("additional_args"): str
-    }),
-    "objdump": Schema({
-        "binary": And(str, len),
-        Opt("disassemble"): bool,
-        Opt("section"): str,
-        Opt("additional_args"): str
-    }),
-    "readelf": Schema({
-        "binary": And(str, len),
-        Opt("headers"): bool,
-        Opt("symbols"): bool,
-        Opt("sections"): bool,
-        Opt("all_info"): bool,
-        Opt("additional_args"): str
-    }),
-    "xxd": Schema({
-        "file_path": And(str, len),
-        Opt("offset"): str,
-        Opt("length"): str,
-        Opt("cols"): int,
-        Opt("reverse"): bool,
-        Opt("additional_args"): str
-    }),
-    "hexdump": Schema({
-        "file_path": And(str, len),
-        Opt("format_type"): str,
-        Opt("offset"): str,
-        Opt("length"): str,
-        Opt("additional_args"): str
-    }),
-    "binwalk": Schema({
-        "file_path": And(str, len),
-        Opt("extract"): bool,
-        Opt("signature"): bool,
-        Opt("entropy"): bool,
-        Opt("additional_args"): str
-    }),
-    "ropgadget": Schema({
-        "binary": And(str, len),
-        Opt("gadget_type"): str,
-        Opt("rop_chain"): bool,
-        Opt("depth"): int,
-        Opt("additional_args"): str
-    }),
-    "ropper": Schema({
-        "binary": And(str, len),
-        Opt("gadget_type"): str,
-        Opt("quality"): int,
-        Opt("arch"): str,
-        Opt("search_string"): str,
-        Opt("additional_args"): str
-    }),
-    "one_gadget": Schema({
-        "libc_path": And(str, len),
-        Opt("level"): int,
-        Opt("additional_args"): str
-    }),
-    "gdb": Schema({
-        "binary": And(str, len),
-        Opt("commands"): str,
-        Opt("script_file"): str,
-        Opt("additional_args"): str
-    }),
-    "gdb_peda": Schema({
-        Opt("binary"): str,
-        Opt("commands"): str,
-        Opt("attach_pid"): int,
-        Opt("core_file"): str,
-        Opt("additional_args"): str
-    }),
-    "gdb_gef": Schema({
-        Opt("binary"): str,
-        Opt("commands"): str,
-        Opt("attach_pid"): int,
-        Opt("core_file"): str,
-        Opt("additional_args"): str
-    }),
-    "radare2": Schema({
-        "binary": And(str, len),
-        Opt("commands"): str,
-        Opt("additional_args"): str
-    }),
-    "ghidra": Schema({
-        "binary": And(str, len),
-        Opt("function"): str,
-        Opt("timeout"): int,
-        Opt("async_mode"): bool
-    }),
-    "pwntools": Schema({
-        Opt("script_content"): str,
-        Opt("target_binary"): str,
-        Opt("target_host"): str,
-        Opt("target_port"): int,
-        Opt("exploit_type"): str,
-        Opt("additional_args"): str
-    }),
-    "angr": Schema({
-        "binary": And(str, len),
-        Opt("script_content"): str,
-        Opt("analysis_type"): str,
-        Opt("find_address"): str,
-        Opt("avoid_addresses"): str,
-        Opt("additional_args"): str,
-        Opt("async_mode"): bool
-    }),
-    "libc_database": Schema({
-        Opt("action"): str,
-        Opt("symbols"): str,
-        Opt("libc_id"): str,
-        Opt("additional_args"): str
-    }),
-    "pwninit": Schema({
-        "binary": And(str, len),
-        Opt("libc"): str,
-        Opt("ld"): str,
-        Opt("template_type"): str,
-        Opt("additional_args"): str
-    }),
-}
-
-
-# ============================================================================
-# VISUAL ENGINE
-# ============================================================================
-
-class ModernVisualEngine:
-    """Visual output formatting for terminal display"""
-
-    COLORS = {
-        'MATRIX_GREEN': '\033[38;5;46m',
-        'NEON_BLUE': '\033[38;5;51m',
-        'ELECTRIC_PURPLE': '\033[38;5;129m',
-        'CYBER_ORANGE': '\033[38;5;208m',
-        'HACKER_RED': '\033[38;5;196m',
-        'TERMINAL_GRAY': '\033[38;5;240m',
-        'BRIGHT_WHITE': '\033[97m',
-        'RESET': '\033[0m',
-        'BOLD': '\033[1m',
-        'BLOOD_RED': '\033[38;5;124m',
-        'CRIMSON': '\033[38;5;160m',
-    }
-
-    PROGRESS_STYLES = {
-        'dots': ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'],
-    }
-
-    @staticmethod
-    def create_banner() -> str:
-        """Create the BEAR banner"""
-        accent = ModernVisualEngine.COLORS['HACKER_RED']
-        RESET = ModernVisualEngine.COLORS['RESET']
-        BOLD = ModernVisualEngine.COLORS['BOLD']
-        return f"""
-{accent}{BOLD}
-██████╗ ███████╗ █████╗ ██████╗
-██╔══██╗██╔════╝██╔══██╗██╔══██╗
-██████╔╝█████╗  ███████║██████╔╝
-██╔══██╗██╔══╝  ██╔══██║██╔══██╗
-██████╔╝███████╗██║  ██║██║  ██║
-╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝
-{RESET}
-{accent}┌─────────────────────────────────────────────────────────────────────────────┐
-│  {ModernVisualEngine.COLORS['BRIGHT_WHITE']}Binary Exploitation & Automated Reversing{accent}                 v{VERSION}           │
-│  {ModernVisualEngine.COLORS['CYBER_ORANGE']}Debuggers | Disassemblers | Exploit Development{accent}                            │
-└─────────────────────────────────────────────────────────────────────────────┘{RESET}
-"""
-
-    @staticmethod
-    def render_progress_bar(progress: float, width: int = 40, style: str = 'cyber',
-                          label: str = "", eta: float = 0, speed: str = "") -> str:
-        """Render a progress bar"""
-        progress = max(0.0, min(1.0, progress))
-        filled_width = int(width * progress)
-        empty_width = width - filled_width
-        bar = '█' * filled_width + '░' * empty_width
-        percentage = f"{progress * 100:.1f}%"
-        extra_info = f" ETA: {eta:.1f}s" if eta > 0 else ""
-        if speed:
-            extra_info += f" Speed: {speed}"
-        if label:
-            return f"{label}: [{bar}] {percentage}{extra_info}"
-        return f"[{bar}] {percentage}{extra_info}"
-
-    @staticmethod
-    def format_tool_status(tool_name: str, status: str, target: str = "", progress: float = 0.0) -> str:
-        """Format tool execution status"""
-        color = ModernVisualEngine.COLORS['MATRIX_GREEN'] if status == 'SUCCESS' else ModernVisualEngine.COLORS['HACKER_RED']
-        return f"{color}🔧 {tool_name.upper()}{ModernVisualEngine.COLORS['RESET']} | {status} | {target}"
-
-
 # ============================================================================
 # CACHING SYSTEM
 # ============================================================================
 
 class BearCache:
-    """Caching system for command results"""
+    """Persistent disk-backed cache for command results."""
 
-    def __init__(self, max_size: int = CACHE_SIZE, ttl: int = CACHE_TTL):
-        self.cache = OrderedDict()
+    def __init__(self, directory: str = CACHE_DIR, max_size: int = CACHE_SIZE,
+                 ttl: int = CACHE_TTL, size_limit: int = CACHE_SIZE_LIMIT):
+        self.cache = DiskCache(directory, size_limit=size_limit)
+        self.directory = directory
         self.max_size = max_size
         self.ttl = ttl
+        self.lock = threading.Lock()
         self.stats = {"hits": 0, "misses": 0, "evictions": 0}
 
-    def _generate_key(self, command: str, params: Dict[str, Any]) -> str:
-        key_data = f"{command}:{json.dumps(params, sort_keys=True)}"
-        return hashlib.md5(key_data.encode()).hexdigest()
+    def _fingerprint_file(self, path: str) -> Dict[str, Any]:
+        if not path or not os.path.exists(path):
+            return {"path": path, "exists": False}
+        stat = os.stat(path)
+        return {
+            "path": os.path.abspath(path),
+            "exists": True,
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
 
-    def _is_expired(self, timestamp: float) -> bool:
-        return time.time() - timestamp > self.ttl
+    def _normalize_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(params or {})
+        fingerprints = {}
+        for field in ("binary", "file_path", "libc_path", "libc", "ld", "script_file"):
+            if field in normalized and normalized[field]:
+                fingerprints[field] = self._fingerprint_file(str(normalized[field]))
+        if fingerprints:
+            normalized["_file_fingerprints"] = fingerprints
+        return normalized
+
+    def _generate_key(self, command: str, params: Dict[str, Any]) -> str:
+        key_data = json.dumps({
+            "command": command,
+            "params": self._normalize_params(params),
+        }, sort_keys=True, default=str)
+        return hashlib.sha256(key_data.encode()).hexdigest()
 
     def get(self, command: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         key = self._generate_key(command, params)
-        if key in self.cache:
-            timestamp, data = self.cache[key]
-            if not self._is_expired(timestamp):
-                self.cache.move_to_end(key)
-                self.stats["hits"] += 1
-                return data
-            else:
-                del self.cache[key]
-        self.stats["misses"] += 1
-        return None
+        sentinel = object()
+        data = self.cache.get(key, default=sentinel)
+        with self.lock:
+            if data is sentinel:
+                self.stats["misses"] += 1
+                return None
+            self.stats["hits"] += 1
+        return data
+
+    def _enforce_entry_limit(self):
+        while len(self.cache) > self.max_size:
+            oldest_key = next(iter(self.cache.iterkeys()))
+            self.cache.delete(oldest_key)
+            with self.lock:
+                self.stats["evictions"] += 1
 
     def set(self, command: str, params: Dict[str, Any], result: Dict[str, Any]):
         key = self._generate_key(command, params)
-        while len(self.cache) >= self.max_size:
-            oldest_key = next(iter(self.cache))
-            del self.cache[oldest_key]
-            self.stats["evictions"] += 1
-        self.cache[key] = (time.time(), result)
+        self.cache.set(key, result, expire=self.ttl)
+        self._enforce_entry_limit()
 
     def clear(self):
         self.cache.clear()
-        self.stats = {"hits": 0, "misses": 0, "evictions": 0}
+        with self.lock:
+            self.stats = {"hits": 0, "misses": 0, "evictions": 0}
 
     def get_stats(self) -> Dict[str, Any]:
-        total = self.stats["hits"] + self.stats["misses"]
-        hit_rate = (self.stats["hits"] / total * 100) if total > 0 else 0
+        with self.lock:
+            stats = dict(self.stats)
+        total = stats["hits"] + stats["misses"]
+        hit_rate = (stats["hits"] / total * 100) if total > 0 else 0
         return {
+            "backend": "diskcache",
+            "directory": self.directory,
             "size": len(self.cache),
             "max_size": self.max_size,
+            "size_limit_bytes": self.cache.size_limit,
+            "volume_bytes": self.cache.volume(),
+            "ttl_seconds": self.ttl,
             "hit_rate": f"{hit_rate:.1f}%",
-            "hits": self.stats["hits"],
-            "misses": self.stats["misses"],
-            "evictions": self.stats["evictions"]
+            "hits": stats["hits"],
+            "misses": stats["misses"],
+            "evictions": stats["evictions"],
         }
 
 
@@ -646,10 +510,12 @@ class EnhancedCommandExecutor:
             }
 
 
-def execute_command(command: str, use_cache: bool = True, timeout: int = COMMAND_TIMEOUT) -> Dict[str, Any]:
+def execute_command(command: str, use_cache: bool = True, timeout: int = COMMAND_TIMEOUT,
+                    cache_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Execute a shell command with caching support"""
+    cache_params = cache_params or {}
     if use_cache:
-        cached_result = cache.get(command, {})
+        cached_result = cache.get(command, cache_params)
         if cached_result:
             return cached_result
 
@@ -657,7 +523,7 @@ def execute_command(command: str, use_cache: bool = True, timeout: int = COMMAND
     result = executor.execute()
 
     if use_cache and result.get("success", False):
-        cache.set(command, {}, result)
+        cache.set(command, cache_params, result)
 
     return result
 
@@ -883,14 +749,14 @@ def find_ghidra_headless():
 # API ROUTES - HEALTH & SYSTEM
 # ============================================================================
 
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health_check():
     """Health check endpoint"""
     logger.debug("Performing health check...")
 
     binary_tools = [
         "gdb", "radare2", "binwalk", "ropgadget", "checksec", "objdump",
-        "one-gadget", "ropper", "angr", "pwninit", "strings",
+        "one-gadget", "ropper", "pwninit", "strings",
         "xxd", "readelf", "hexdump"
     ]
 
@@ -909,7 +775,7 @@ def health_check():
 
     available_count = sum(1 for available in tools_status.values() if available)
 
-    return jsonify({
+    return {
         "status": "healthy",
         "message": "BEAR - Binary Exploitation & Automated Reversing Server is operational",
         "version": VERSION,
@@ -919,85 +785,55 @@ def health_check():
         "cache_stats": cache.get_stats(),
         "telemetry": telemetry.get_stats(),
         "uptime": time.time() - telemetry.stats["start_time"]
-    })
+    }
 
 
-@app.route("/api/command", methods=["POST"])
-def generic_command():
+@app.post("/api/command")
+def generic_command(params: GenericCommandRequest):
     """Execute any command"""
     try:
-        params = request.json
-        command = params.get("command", "")
-        use_cache = params.get("use_cache", True)
-
-        if not command:
-            return jsonify({"error": "Command parameter is required"}), 400
-
-        result = execute_command(command, use_cache)
-        return jsonify(result)
+        return execute_command(params.command, params.use_cache)
     except Exception as e:
         logger.error(f"[API] /api/command - Error: {str(e)}")
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 
 # ============================================================================
 # API ROUTES - FILE OPERATIONS
 # ============================================================================
 
-@app.route("/api/files/create", methods=["POST"])
-def create_file():
-    params = request.json
-    filename = params.get("filename", "")
-    content = params.get("content", "")
-    binary = params.get("binary", False)
-    if not filename:
-        return jsonify({"error": "Filename is required"}), 400
-    result = file_manager.create_file(filename, content, binary)
-    return jsonify(result)
+@app.post("/api/files/create")
+def create_file(params: FileCreateRequest):
+    return file_manager.create_file(params.filename, params.content, params.binary)
 
 
-@app.route("/api/files/modify", methods=["POST"])
-def modify_file():
-    params = request.json
-    filename = params.get("filename", "")
-    content = params.get("content", "")
-    append = params.get("append", False)
-    if not filename:
-        return jsonify({"error": "Filename is required"}), 400
-    result = file_manager.modify_file(filename, content, append)
-    return jsonify(result)
+@app.post("/api/files/modify")
+def modify_file(params: FileModifyRequest):
+    return file_manager.modify_file(params.filename, params.content, params.append)
 
 
-@app.route("/api/files/delete", methods=["POST"])
-def delete_file():
-    params = request.json
-    filename = params.get("filename", "")
-    if not filename:
-        return jsonify({"error": "Filename is required"}), 400
-    result = file_manager.delete_file(filename)
-    return jsonify(result)
+@app.post("/api/files/delete")
+def delete_file(params: FileDeleteRequest):
+    return file_manager.delete_file(params.filename)
 
 
-@app.route("/api/files/list", methods=["GET"])
-def list_files():
-    directory = request.args.get("directory", ".")
-    result = file_manager.list_files(directory)
-    return jsonify(result)
+@app.get("/api/files/list")
+def list_files(directory: str = Query(".")):
+    return file_manager.list_files(directory)
 
 
 # ============================================================================
 # API ROUTES - PAYLOAD GENERATION
 # ============================================================================
 
-@app.route("/api/payloads/generate", methods=["POST"])
-def generate_payload():
+@app.post("/api/payloads/generate")
+def generate_payload(params: PayloadGenerateRequest):
     """Generate payloads for testing"""
     try:
-        params = request.json
-        payload_type = params.get("type", "buffer")
-        size = params.get("size", 1024)
-        pattern = params.get("pattern", "A")
-        filename = params.get("filename", f"payload_{int(time.time())}.bin")
+        payload_type = params.type
+        size = params.size
+        pattern = params.pattern
+        filename = params.filename or f"payload_{int(time.time())}.bin"
 
         if payload_type == "buffer":
             content = pattern * size
@@ -1018,36 +854,36 @@ def generate_payload():
         result = file_manager.create_file(filename, content)
         result["payload_type"] = payload_type
         result["payload_size"] = size
-        return jsonify(result)
+        return result
     except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 
 # ============================================================================
 # API ROUTES - CACHE & TELEMETRY
 # ============================================================================
 
-@app.route("/api/cache/stats", methods=["GET"])
+@app.get("/api/cache/stats")
 def cache_stats():
-    return jsonify(cache.get_stats())
+    return cache.get_stats()
 
 
-@app.route("/api/cache/clear", methods=["POST"])
+@app.post("/api/cache/clear")
 def clear_cache():
     cache.clear()
-    return jsonify({"success": True, "message": "Cache cleared"})
+    return {"success": True, "message": "Cache cleared"}
 
 
-@app.route("/api/telemetry", methods=["GET"])
+@app.get("/api/telemetry")
 def get_telemetry():
-    return jsonify(telemetry.get_stats())
+    return telemetry.get_stats()
 
 
 # ============================================================================
 # API ROUTES - PROCESS MANAGEMENT
 # ============================================================================
 
-@app.route("/api/processes/list", methods=["GET"])
+@app.get("/api/processes/list")
 def list_processes():
     processes = ProcessManager.list_active_processes()
     process_list = []
@@ -1059,40 +895,40 @@ def list_processes():
             "runtime": info.get("runtime", 0),
             "progress": info.get("progress", 0)
         })
-    return jsonify({
+    return {
         "success": True,
         "total_count": len(process_list),
         "processes": process_list
-    })
+    }
 
 
-@app.route("/api/processes/status/<int:pid>", methods=["GET"])
-def process_status(pid):
+@app.get("/api/processes/status/{pid}")
+def process_status(pid: int):
     status = ProcessManager.get_process_status(pid)
     if status:
-        return jsonify({"success": True, "process": status})
-    return jsonify({"success": False, "error": "Process not found"}), 404
+        return {"success": True, "process": status}
+    return JSONResponse(status_code=404, content={"success": False, "error": "Process not found"})
 
 
-@app.route("/api/processes/terminate/<int:pid>", methods=["POST"])
-def terminate_process(pid):
+@app.post("/api/processes/terminate/{pid}")
+def terminate_process(pid: int):
     success = ProcessManager.terminate_process(pid)
-    return jsonify({"success": success})
+    return {"success": success}
 
 
-@app.route("/api/processes/pause/<int:pid>", methods=["POST"])
-def pause_process(pid):
+@app.post("/api/processes/pause/{pid}")
+def pause_process(pid: int):
     success = ProcessManager.pause_process(pid)
-    return jsonify({"success": success})
+    return {"success": success}
 
 
-@app.route("/api/processes/resume/<int:pid>", methods=["POST"])
-def resume_process(pid):
+@app.post("/api/processes/resume/{pid}")
+def resume_process(pid: int):
     success = ProcessManager.resume_process(pid)
-    return jsonify({"success": success})
+    return {"success": success}
 
 
-@app.route("/api/processes/dashboard", methods=["GET"])
+@app.get("/api/processes/dashboard")
 def process_dashboard():
     processes = ProcessManager.list_active_processes()
     dashboard = []
@@ -1107,48 +943,35 @@ def process_dashboard():
             "progress_percent": f"{progress * 100:.1f}%",
             "runtime": f"{info.get('runtime', 0):.1f}s"
         })
-    return jsonify({
+    return {
         "success": True,
         "total_processes": len(dashboard),
         "processes": dashboard
-    })
+    }
 
 
 # ============================================================================
 # API ROUTES - PYTHON ENVIRONMENT
 # ============================================================================
 
-@app.route("/api/python/install", methods=["POST"])
-def install_package():
-    params = request.json
-    package = params.get("package", "")
-    env_name = params.get("env_name", "default")
-    if not package:
-        return jsonify({"error": "Package name is required"}), 400
-    result = python_env_manager.install_package(env_name, package)
-    return jsonify(result)
+@app.post("/api/python/install")
+def install_package(params: PythonInstallRequest):
+    return python_env_manager.install_package(params.env_name, params.package)
 
 
-@app.route("/api/python/execute", methods=["POST"])
-def execute_script():
-    params = request.json
-    script = params.get("script", "")
-    env_name = params.get("env_name", "default")
-    filename = params.get("filename", "")
-    if not script:
-        return jsonify({"error": "Script content is required"}), 400
-    result = python_env_manager.execute_script(env_name, script, filename)
-    return jsonify(result)
+@app.post("/api/python/execute")
+def execute_script(params: PythonExecuteRequest):
+    return python_env_manager.execute_script(params.env_name, params.script, params.filename)
 
 
 # ============================================================================
 # BINARY ANALYSIS TOOLS - CORE
 # ============================================================================
 
-@app.route("/api/tools/gdb", methods=["POST"])
-@tool_endpoint(SCHEMAS["gdb"], "gdb")
-def gdb(params):
+@app.post("/api/tools/gdb")
+def gdb(params: GdbRequest):
     """Execute GDB for binary analysis and debugging"""
+    params = params.model_dump()
     temp_script = None
     command = f"gdb {params['binary']}"
     if params.get("script_file"):
@@ -1161,15 +984,15 @@ def gdb(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
     command += " -batch"
-    result = execute_command(command)
+    result = execute_command(command, cache_params=params)
     cleanup_temp_file(temp_script)
     return result
 
 
-@app.route("/api/tools/gdb-peda", methods=["POST"])
-@tool_endpoint(SCHEMAS["gdb_peda"], "gdb-peda")
-def gdb_peda(params):
+@app.post("/api/tools/gdb-peda")
+def gdb_peda(params: GdbEnhancedRequest):
     """Execute GDB with PEDA for enhanced debugging"""
+    params = params.model_dump()
     binary = params.get("binary", "")
     attach_pid = params.get("attach_pid", 0)
     core_file = params.get("core_file", "")
@@ -1197,15 +1020,15 @@ def gdb_peda(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
 
-    result = execute_command(command)
+    result = execute_command(command, cache_params=params)
     cleanup_temp_file(temp_script)
     return result
 
 
-@app.route("/api/tools/gdb-gef", methods=["POST"])
-@tool_endpoint(SCHEMAS["gdb_gef"], "gdb-gef")
-def gdb_gef(params):
+@app.post("/api/tools/gdb-gef")
+def gdb_gef(params: GdbEnhancedRequest):
     """Execute GDB with GEF for exploit development"""
+    params = params.model_dump()
     binary = params.get("binary", "")
     attach_pid = params.get("attach_pid", 0)
     core_file = params.get("core_file", "")
@@ -1233,15 +1056,15 @@ def gdb_gef(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
 
-    result = execute_command(command)
+    result = execute_command(command, cache_params=params)
     cleanup_temp_file(temp_script)
     return result
 
 
-@app.route("/api/tools/radare2", methods=["POST"])
-@tool_endpoint(SCHEMAS["radare2"], "radare2")
-def radare2(params):
+@app.post("/api/tools/radare2")
+def radare2(params: Radare2Request):
     """Execute Radare2 for binary analysis"""
+    params = params.model_dump()
     temp_script = None
     if params.get("commands"):
         temp_script = "/tmp/r2_commands.txt"
@@ -1254,20 +1077,51 @@ def radare2(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
 
-    result = execute_command(command)
+    result = execute_command(command, cache_params=params)
     cleanup_temp_file(temp_script)
     return result
 
 
-@app.route("/api/tools/ghidra/decompile", methods=["POST"])
-@tool_endpoint(SCHEMAS["ghidra"], "ghidra")
-def ghidra_decompile(params):
-    """Decompile binary using Ghidra headless mode with custom script"""
+@app.post("/api/tools/triage")
+def triage_binary(params: TriageRequest):
+    """Run a quick binary triage with common static-analysis commands."""
+    params = params.model_dump()
     binary = params["binary"]
-    function_name = params.get("function", "all")
-    analysis_timeout = params.get("timeout", 300)
-    async_mode = params.get("async_mode", False)
+    strings_limit = params.get("strings_limit", 40)
+    use_cache = params.get("use_cache", True)
 
+    if not os.path.exists(binary):
+        raise ValueError(f"Binary not found: {binary}")
+
+    commands = {
+        "file": f'file "{binary}"',
+        "sha256": f'sha256sum "{binary}"',
+        "checksec": f'checksec --file="{binary}"',
+        "elf_header": f'readelf -h "{binary}"',
+        "dynamic_symbols": f'readelf -Ws "{binary}"',
+    }
+    if strings_limit > 0:
+        commands["strings"] = f'strings -n 4 "{binary}" | head -n {strings_limit}'
+
+    results = {}
+    for name, command in commands.items():
+        results[name] = execute_command(command, use_cache=use_cache, cache_params=params)
+
+    return {
+        "success": True,
+        "binary": binary,
+        "checks": results,
+        "summary": {
+            "file": results.get("file", {}).get("stdout", "").strip(),
+            "sha256": results.get("sha256", {}).get("stdout", "").split()[0] if results.get("sha256", {}).get("stdout") else "",
+            "checksec_available": results.get("checksec", {}).get("success", False),
+        },
+    }
+
+
+def build_ghidra_command(binary: str, function_name: str, script_name: str, project_prefix: str,
+                         extra_args: Optional[list[str]] = None) -> str:
+    """Build a Ghidra headless command for a BEAR script."""
     if not os.path.exists(binary):
         raise ValueError(f"Binary not found: {binary}")
 
@@ -1276,15 +1130,81 @@ def ghidra_decompile(params):
         raise ValueError("Ghidra analyzeHeadless not found. Set GHIDRA_HEADLESS environment variable.")
 
     script_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ghidra_scripts")
-    decompile_script = "DecompileFunction.java"
 
-    if not os.path.exists(os.path.join(script_dir, decompile_script)):
-        raise ValueError(f"Decompile script not found: {script_dir}/{decompile_script}")
+    if not os.path.exists(os.path.join(script_dir, script_name)):
+        raise ValueError(f"Ghidra script not found: {script_dir}/{script_name}")
 
-    project_dir = f"/tmp/ghidra_projects/decompile_{os.path.basename(binary)}_{int(time.time())}"
+    project_dir = f"/tmp/ghidra_projects/{project_prefix}_{os.path.basename(binary)}_{int(time.time())}"
     os.makedirs(project_dir, exist_ok=True)
 
-    command = f'"{ghidra_headless}" "{project_dir}" decompile_project -import "{binary}" -scriptPath "{script_dir}" -postScript {decompile_script} "{function_name}" -deleteProject'
+    script_args = [function_name] + list(extra_args or [])
+    formatted_args = " ".join(f'"{arg}"' for arg in script_args)
+    return f'"{ghidra_headless}" "{project_dir}" bear_project -import "{binary}" -scriptPath "{script_dir}" -postScript {script_name} {formatted_args} -deleteProject'
+
+
+def extract_ghidra_json(stdout: str) -> Dict[str, Any]:
+    """Extract JSON payload emitted by BEAR Ghidra scripts."""
+    start_marker = "===BEAR_JSON_START==="
+    end_marker = "===BEAR_JSON_END==="
+    if start_marker not in stdout or end_marker not in stdout:
+        raise ValueError("Ghidra output did not include BEAR JSON markers")
+
+    json_start = stdout.index(start_marker) + len(start_marker)
+    json_end = stdout.index(end_marker)
+    json_str = stdout[json_start:json_end].strip()
+    return json.loads(json_str)
+
+
+def run_ghidra_inspection(params: Dict[str, Any], mode: str, extra_args: list[str]) -> Dict[str, Any]:
+    """Run the shared Ghidra inspection script and parse its JSON output."""
+    binary = params["binary"]
+    analysis_timeout = params.get("timeout", 300)
+    async_mode = params.get("async_mode", False)
+
+    command = build_ghidra_command(binary, mode, "InspectBinary.java", mode, extra_args)
+
+    if async_mode:
+        task_id = f"ghidra_{mode}_{int(time.time() * 1000)}"
+        run_async_task(task_id, command, analysis_timeout)
+        return {
+            "success": True,
+            "async": True,
+            "task_id": task_id,
+            "status": "queued",
+            "message": f"Ghidra {mode} inspection submitted. Poll GET /api/tasks/{task_id} for results.",
+        }
+
+    result = execute_command(command, timeout=analysis_timeout, cache_params=params)
+    if result.get("success") and result.get("stdout"):
+        try:
+            inspected = extract_ghidra_json(result["stdout"])
+            inspected["success"] = True
+            inspected["mode"] = mode
+            return inspected
+        except (ValueError, json.JSONDecodeError) as e:
+            return {
+                "success": False,
+                "error": f"Failed to parse Ghidra {mode} output: {str(e)}",
+                "raw_output": result.get("stdout", ""),
+            }
+
+    return {
+        "success": False,
+        "error": f"Ghidra {mode} inspection failed or produced no output",
+        "details": result,
+    }
+
+
+@app.post("/api/tools/ghidra/decompile")
+def ghidra_decompile(params: GhidraRequest):
+    """Decompile binary using Ghidra headless mode with custom script"""
+    params = params.model_dump()
+    binary = params["binary"]
+    function_name = params.get("function", "all")
+    analysis_timeout = params.get("timeout", 300)
+    async_mode = params.get("async_mode", False)
+
+    command = build_ghidra_command(binary, function_name, "DecompileFunction.java", "decompile")
 
     if async_mode:
         task_id = f"ghidra_{int(time.time() * 1000)}"
@@ -1297,32 +1217,24 @@ def ghidra_decompile(params):
             "message": f"Ghidra decompilation submitted. Poll GET /api/tasks/{task_id} for results.",
         }
 
-    result = execute_command(command, timeout=analysis_timeout)
+    result = execute_command(command, timeout=analysis_timeout, cache_params=params)
 
     if result.get("success") and result.get("stdout"):
         stdout = result["stdout"]
-        start_marker = "===BEAR_JSON_START==="
-        end_marker = "===BEAR_JSON_END==="
-
-        if start_marker in stdout and end_marker in stdout:
-            json_start = stdout.index(start_marker) + len(start_marker)
-            json_end = stdout.index(end_marker)
-            json_str = stdout[json_start:json_end].strip()
-
-            try:
-                decompiled = json.loads(json_str)
-                return {
-                    "success": True,
-                    "binary": binary,
-                    "function": function_name,
-                    "decompiled": decompiled
-                }
-            except json.JSONDecodeError as e:
-                return {
-                    "success": False,
-                    "error": f"Failed to parse decompilation output: {str(e)}",
-                    "raw_output": stdout
-                }
+        try:
+            decompiled = extract_ghidra_json(stdout)
+            return {
+                "success": True,
+                "binary": binary,
+                "function": function_name,
+                "decompiled": decompiled
+            }
+        except (ValueError, json.JSONDecodeError) as e:
+            return {
+                "success": False,
+                "error": f"Failed to parse decompilation output: {str(e)}",
+                "raw_output": stdout
+            }
 
     return {
         "success": False,
@@ -1331,10 +1243,87 @@ def ghidra_decompile(params):
     }
 
 
-@app.route("/api/tools/binwalk", methods=["POST"])
-@tool_endpoint(SCHEMAS["binwalk"], "binwalk")
-def binwalk(params):
+@app.post("/api/tools/ghidra/disassemble")
+def ghidra_disassemble(params: GhidraRequest):
+    """Disassemble binary using Ghidra headless mode with custom script"""
+    params = params.model_dump()
+    binary = params["binary"]
+    function_name = params.get("function", "all")
+    analysis_timeout = params.get("timeout", 300)
+    async_mode = params.get("async_mode", False)
+
+    command = build_ghidra_command(binary, function_name, "DisassembleFunction.java", "disassemble")
+
+    if async_mode:
+        task_id = f"ghidra_disassemble_{int(time.time() * 1000)}"
+        run_async_task(task_id, command, analysis_timeout)
+        return {
+            "success": True,
+            "async": True,
+            "task_id": task_id,
+            "status": "queued",
+            "message": f"Ghidra disassembly submitted. Poll GET /api/tasks/{task_id} for results.",
+        }
+
+    result = execute_command(command, timeout=analysis_timeout, cache_params=params)
+
+    if result.get("success") and result.get("stdout"):
+        stdout = result["stdout"]
+        try:
+            disassembled = extract_ghidra_json(stdout)
+            return {
+                "success": True,
+                "binary": binary,
+                "function": function_name,
+                "disassembled": disassembled
+            }
+        except (ValueError, json.JSONDecodeError) as e:
+            return {
+                "success": False,
+                "error": f"Failed to parse disassembly output: {str(e)}",
+                "raw_output": stdout
+            }
+
+    return {
+        "success": False,
+        "error": "Disassembly failed or produced no output",
+        "details": result
+    }
+
+
+@app.post("/api/tools/ghidra/functions")
+def ghidra_functions(params: GhidraFunctionsRequest):
+    """List functions discovered by Ghidra."""
+    params = params.model_dump()
+    return run_ghidra_inspection(params, "functions", [])
+
+
+@app.post("/api/tools/ghidra/xrefs")
+def ghidra_xrefs(params: GhidraXrefsRequest):
+    """Find references to/from a function, symbol, string, or address."""
+    params = params.model_dump()
+    return run_ghidra_inspection(
+        params,
+        "xrefs",
+        [params["target"], params.get("direction", "both"), params.get("target_type", "auto")],
+    )
+
+
+@app.post("/api/tools/ghidra/callgraph")
+def ghidra_callgraph(params: GhidraCallgraphRequest):
+    """Build a Ghidra call graph for all functions or a selected root."""
+    params = params.model_dump()
+    return run_ghidra_inspection(
+        params,
+        "callgraph",
+        [params.get("function", "all"), params.get("direction", "out"), str(params.get("depth", 2))],
+    )
+
+
+@app.post("/api/tools/binwalk")
+def binwalk(params: BinwalkRequest):
     """Execute Binwalk for firmware analysis"""
+    params = params.model_dump()
     command = "binwalk"
     if params.get("extract"):
         command += " -e"
@@ -1345,25 +1334,25 @@ def binwalk(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
     command += f" {params['file_path']}"
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
 # ============================================================================
 # BINARY ANALYSIS TOOLS - INSPECTION
 # ============================================================================
 
-@app.route("/api/tools/checksec", methods=["POST"])
-@tool_endpoint(SCHEMAS["checksec"], "checksec")
-def checksec(params):
+@app.post("/api/tools/checksec")
+def checksec(params: ChecksecRequest):
     """Check security features of a binary"""
+    params = params.model_dump()
     command = f"checksec --file={params['binary']}"
-    return execute_command(command, use_cache=True)
+    return execute_command(command, use_cache=True, cache_params=params)
 
 
-@app.route("/api/tools/strings", methods=["POST"])
-@tool_endpoint(SCHEMAS["strings"], "strings")
-def strings(params):
+@app.post("/api/tools/strings")
+def strings(params: StringsRequest):
     """Extract strings from a binary"""
+    params = params.model_dump()
     min_len = params.get("min_len", 4)
     command = f"strings -n {min_len}"
     if params.get("encoding"):
@@ -1371,13 +1360,13 @@ def strings(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
     command += f" {params['file_path']}"
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
-@app.route("/api/tools/objdump", methods=["POST"])
-@tool_endpoint(SCHEMAS["objdump"], "objdump")
-def objdump(params):
+@app.post("/api/tools/objdump")
+def objdump(params: ObjdumpRequest):
     """Analyze a binary using objdump"""
+    params = params.model_dump()
     command = "objdump -M intel"
     if params.get("disassemble", True):
         command += " -d"
@@ -1388,13 +1377,13 @@ def objdump(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
     command += f" {params['binary']}"
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
-@app.route("/api/tools/readelf", methods=["POST"])
-@tool_endpoint(SCHEMAS["readelf"], "readelf")
-def readelf(params):
+@app.post("/api/tools/readelf")
+def readelf(params: ReadelfRequest):
     """Analyze ELF file headers and structure"""
+    params = params.model_dump()
     command = "readelf"
     if params.get("all_info"):
         command += " -a"
@@ -1408,13 +1397,13 @@ def readelf(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
     command += f" {params['binary']}"
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
-@app.route("/api/tools/xxd", methods=["POST"])
-@tool_endpoint(SCHEMAS["xxd"], "xxd")
-def xxd(params):
+@app.post("/api/tools/xxd")
+def xxd(params: XxdRequest):
     """Create a hex dump using xxd"""
+    params = params.model_dump()
     command = f"xxd -s {params.get('offset', '0')}"
     if params.get("length"):
         command += f" -l {params['length']}"
@@ -1422,13 +1411,13 @@ def xxd(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
     command += f" {params['file_path']}"
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
-@app.route("/api/tools/hexdump", methods=["POST"])
-@tool_endpoint(SCHEMAS["hexdump"], "hexdump")
-def hexdump(params):
+@app.post("/api/tools/hexdump")
+def hexdump(params: HexdumpRequest):
     """Create a hex dump using hexdump"""
+    params = params.model_dump()
     format_type = params.get("format_type", "canonical")
     command = "hexdump"
     if format_type == "canonical":
@@ -1445,17 +1434,17 @@ def hexdump(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
     command += f" {params['file_path']}"
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
 # ============================================================================
 # BINARY ANALYSIS TOOLS - EXPLOIT DEVELOPMENT
 # ============================================================================
 
-@app.route("/api/tools/ropgadget", methods=["POST"])
-@tool_endpoint(SCHEMAS["ropgadget"], "ropgadget")
-def ropgadget(params):
+@app.post("/api/tools/ropgadget")
+def ropgadget(params: RopgadgetRequest):
     """Search for ROP gadgets using ROPgadget"""
+    params = params.model_dump()
     command = f"ROPgadget --binary {params['binary']}"
     if params.get("gadget_type"):
         command += f" --only '{params['gadget_type']}'"
@@ -1464,13 +1453,13 @@ def ropgadget(params):
     command += f" --depth {params.get('depth', 10)}"
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
-@app.route("/api/tools/ropper", methods=["POST"])
-@tool_endpoint(SCHEMAS["ropper"], "ropper")
-def ropper(params):
+@app.post("/api/tools/ropper")
+def ropper(params: RopperRequest):
     """Execute ropper for ROP/JOP gadget searching"""
+    params = params.model_dump()
     command = f"ropper --file {params['binary']}"
     gadget_type = params.get("gadget_type", "rop")
     if gadget_type == "rop":
@@ -1490,23 +1479,23 @@ def ropper(params):
         command += f" --search '{params['search_string']}'"
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
-@app.route("/api/tools/one-gadget", methods=["POST"])
-@tool_endpoint(SCHEMAS["one_gadget"], "one-gadget")
-def one_gadget(params):
+@app.post("/api/tools/one-gadget")
+def one_gadget(params: OneGadgetRequest):
     """Find one-shot RCE gadgets in libc"""
+    params = params.model_dump()
     command = f"one_gadget {params['libc_path']} --level {params.get('level', 1)}"
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
-@app.route("/api/tools/pwntools", methods=["POST"])
-@tool_endpoint(SCHEMAS["pwntools"], "pwntools")
-def pwntools(params):
+@app.post("/api/tools/pwntools")
+def pwntools(params: PwntoolsRequest):
     """Execute Pwntools for exploit development"""
+    params = params.model_dump()
     script_content = params.get("script_content", "")
     target_binary = params.get("target_binary", "")
     target_host = params.get("target_host", "")
@@ -1548,86 +1537,15 @@ p.interactive()
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
 
-    result = execute_command(command)
+    result = execute_command(command, cache_params=params)
     cleanup_temp_file(script_file)
     return result
 
 
-@app.route("/api/tools/angr", methods=["POST"])
-@tool_endpoint(SCHEMAS["angr"], "angr")
-def angr(params):
-    """Execute angr for symbolic execution"""
-    binary = params["binary"]
-    script_content = params.get("script_content", "")
-    find_address = params.get("find_address", "")
-    avoid_addresses = params.get("avoid_addresses", "")
-    analysis_type = params.get("analysis_type", "symbolic")
-    async_mode = params.get("async_mode", False)
-
-    script_file = "/tmp/angr_analysis.py"
-
-    if script_content:
-        with open(script_file, "w") as f:
-            f.write(script_content)
-    else:
-        template = f"""#!/usr/bin/env python3
-import angr
-import sys
-
-project = angr.Project('{binary}', auto_load_libs=False)
-print(f"Loaded binary: {binary}")
-print(f"Architecture: {{project.arch}}")
-print(f"Entry point: {{hex(project.entry)}}")
-"""
-        if analysis_type == "symbolic" and find_address:
-            template += f"""
-state = project.factory.entry_state()
-simgr = project.factory.simulation_manager(state)
-find_addr = {find_address}
-avoid_addrs = {avoid_addresses.split(',') if avoid_addresses else []}
-simgr.explore(find=find_addr, avoid=avoid_addrs)
-if simgr.found:
-    print("Found solution!")
-    solution_state = simgr.found[0]
-    print(f"Input: {{solution_state.posix.dumps(0)}}")
-else:
-    print("No solution found")
-"""
-        elif analysis_type == "cfg":
-            template += """
-cfg = project.analyses.CFGFast()
-print(f"CFG nodes: {len(cfg.graph.nodes())}")
-print(f"CFG edges: {len(cfg.graph.edges())}")
-for func_addr, func in list(cfg.functions.items())[:10]:
-    print(f"Function: {func.name} at {hex(func_addr)}")
-"""
-        with open(script_file, "w") as f:
-            f.write(template)
-
-    command = f"python3 {script_file}"
-    if params.get("additional_args"):
-        command += f" {params['additional_args']}"
-
-    if async_mode:
-        task_id = f"angr_{int(time.time() * 1000)}"
-        run_async_task(task_id, command, timeout=600, cleanup_file=script_file)
-        return {
-            "success": True,
-            "async": True,
-            "task_id": task_id,
-            "status": "queued",
-            "message": f"Angr analysis submitted. Poll GET /api/tasks/{task_id} for results.",
-        }
-
-    result = execute_command(command, timeout=600)
-    cleanup_temp_file(script_file)
-    return result
-
-
-@app.route("/api/tools/libc-database", methods=["POST"])
-@tool_endpoint(SCHEMAS["libc_database"], "libc-database")
-def libc_database(params):
+@app.post("/api/tools/libc-database")
+def libc_database(params: LibcDatabaseRequest):
     """Libc identification and offset lookup"""
+    params = params.model_dump()
     action = params.get("action", "find")
     symbols = params.get("symbols", "")
     libc_id = params.get("libc_id", "")
@@ -1651,13 +1569,13 @@ def libc_database(params):
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
 
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
-@app.route("/api/tools/pwninit", methods=["POST"])
-@tool_endpoint(SCHEMAS["pwninit"], "pwninit")
-def pwninit(params):
+@app.post("/api/tools/pwninit")
+def pwninit(params: PwninitRequest):
     """CTF binary exploitation setup"""
+    params = params.model_dump()
     command = f"pwninit --bin {params['binary']}"
     if params.get("libc"):
         command += f" --libc {params['libc']}"
@@ -1667,14 +1585,14 @@ def pwninit(params):
         command += f" --template-type {params['template_type']}"
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
-    return execute_command(command)
+    return execute_command(command, cache_params=params)
 
 
 # ============================================================================
 # API ROUTES - ASYNC TASKS
 # ============================================================================
 
-@app.route("/api/tasks", methods=["GET"])
+@app.get("/api/tasks")
 def list_tasks():
     """List all async tasks and their current status"""
     with task_lock:
@@ -1691,16 +1609,16 @@ def list_tasks():
             if info["status"] == "running" and info["started_at"]:
                 entry["runtime_seconds"] = round(time.time() - info["started_at"], 1)
             tasks.append(entry)
-    return jsonify({"success": True, "total": len(tasks), "tasks": tasks})
+    return {"success": True, "total": len(tasks), "tasks": tasks}
 
 
-@app.route("/api/tasks/<task_id>", methods=["GET"])
+@app.get("/api/tasks/{task_id}")
 def get_task(task_id):
     """Get the status and result of a specific async task"""
     with task_lock:
         info = task_results.get(task_id)
     if info is None:
-        return jsonify({"error": f"Task not found: {task_id}"}), 404
+        return JSONResponse(status_code=404, content={"error": f"Task not found: {task_id}"})
     response = {
         "task_id": task_id,
         "status": info["status"],
@@ -1712,19 +1630,22 @@ def get_task(task_id):
         response["runtime_seconds"] = round(time.time() - info["started_at"], 1)
     if info["status"] in ("completed", "failed") and info["result"] is not None:
         response["result"] = info["result"]
-    return jsonify(response)
+    return response
 
 
-@app.route("/api/tasks/<task_id>", methods=["DELETE"])
+@app.delete("/api/tasks/{task_id}")
 def cancel_task(task_id):
     """Cancel a queued or running async task"""
     with task_lock:
         info = task_results.get(task_id)
     if info is None:
-        return jsonify({"error": f"Task not found: {task_id}"}), 404
+        return JSONResponse(status_code=404, content={"error": f"Task not found: {task_id}"})
     status = info["status"]
     if status in ("completed", "failed"):
-        return jsonify({"success": False, "task_id": task_id, "error": f"Task already {status}, cannot cancel"}), 400
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "task_id": task_id, "error": f"Task already {status}, cannot cancel"},
+        )
     cancelled = False
     with task_lock:
         processes_snapshot = dict(active_processes)
@@ -1738,16 +1659,17 @@ def cancel_task(task_id):
             task_results[task_id]["status"] = "cancelled"
             task_results[task_id]["completed_at"] = time.time()
     logger.info(f"[ASYNC] Task {task_id} cancelled (process terminated: {cancelled})")
-    return jsonify({"success": True, "task_id": task_id, "status": "cancelled", "process_terminated": cancelled})
+    return {"success": True, "task_id": task_id, "status": "cancelled", "process_terminated": cancelled}
 
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
-BANNER = ModernVisualEngine.create_banner()
+BANNER = ModernVisualEngine.create_banner(VERSION)
 
-if __name__ == "__main__":
+def main():
+    """Run the BEAR API server."""
     print(BANNER)
 
     parser = argparse.ArgumentParser(description="BEAR - Binary Exploitation & Automated Reversing Server")
@@ -1764,6 +1686,11 @@ if __name__ == "__main__":
     logger.info(f"Starting BEAR Server on port {port}")
     logger.info(f"Debug mode: {debug_mode}")
     logger.info(f"Cache size: {CACHE_SIZE} | TTL: {CACHE_TTL}s")
+    logger.info(f"Cache directory: {CACHE_DIR}")
     logger.info(f"Command timeout: {COMMAND_TIMEOUT}s")
 
-    app.run(host="0.0.0.0", port=port, debug=debug_mode)
+    uvicorn.run("bear_server:app", host="0.0.0.0", port=port, reload=debug_mode, log_level="debug" if debug_mode else "info")
+
+
+if __name__ == "__main__":
+    main()

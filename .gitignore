@@ -17,6 +17,9 @@ build/
 # Logs
 *.log
 
+# Runtime cache
+.bear_cache/
+
 # Test binaries
 *.elf
 *.bin

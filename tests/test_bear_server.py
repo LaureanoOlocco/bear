@@ -4,10 +4,11 @@ Tests for the BEAR API endpoints with mocked command execution
 """
 
 import pytest
-import json
 import os
 import sys
 from unittest.mock import patch, MagicMock
+
+from fastapi.testclient import TestClient
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,10 +18,8 @@ from bear_server import app
 
 @pytest.fixture
 def client():
-    """Create a test client for the Flask app"""
-    app.config['TESTING'] = True
-    with app.test_client() as client:
-        yield client
+    """Create a test client for the FastAPI app"""
+    yield TestClient(app)
 
 
 @pytest.fixture
@@ -37,15 +36,47 @@ class TestHealthEndpoints:
         """Test /health endpoint returns OK"""
         response = client.get('/health')
         assert response.status_code == 200
-        data = json.loads(response.data)
+        data = response.json()
         assert data['status'] == 'healthy'
 
     def test_cache_stats(self, client):
         """Test /api/cache/stats endpoint"""
         response = client.get('/api/cache/stats')
         assert response.status_code == 200
-        data = json.loads(response.data)
+        data = response.json()
         assert isinstance(data, dict)
+
+
+class TestTriageEndpoints:
+    """Tests for binary triage endpoint"""
+
+    @patch('bear_server.execute_command')
+    @patch('os.path.exists')
+    def test_triage_binary_success(self, mock_exists, mock_execute, client):
+        """Test successful binary triage"""
+        mock_exists.return_value = True
+        mock_execute.side_effect = [
+            {'success': True, 'stdout': '/tmp/test: ELF 64-bit', 'stderr': '', 'return_code': 0},
+            {'success': True, 'stdout': 'abc123  /tmp/test', 'stderr': '', 'return_code': 0},
+            {'success': True, 'stdout': 'NX enabled', 'stderr': '', 'return_code': 0},
+            {'success': True, 'stdout': 'ELF Header', 'stderr': '', 'return_code': 0},
+            {'success': True, 'stdout': 'Symbol table', 'stderr': '', 'return_code': 0},
+            {'success': True, 'stdout': 'hello\nworld', 'stderr': '', 'return_code': 0},
+        ]
+
+        response = client.post('/api/tools/triage', json={'binary': '/tmp/test'})
+        assert response.status_code == 200
+        data = response.json()
+        assert data['success'] is True
+        assert data['summary']['sha256'] == 'abc123'
+        assert 'checksec' in data['checks']
+
+    def test_triage_binary_missing_binary(self, client):
+        """Test triage validation when binary is missing"""
+        response = client.post('/api/tools/triage', json={})
+        assert response.status_code == 400
+        data = response.json()
+        assert 'error' in data
 
 
 class TestGhidraEndpoints:
@@ -53,20 +84,16 @@ class TestGhidraEndpoints:
 
     def test_ghidra_decompile_missing_binary(self, client):
         """Test ghidra/decompile endpoint returns error when binary is missing"""
-        response = client.post('/api/tools/ghidra/decompile',
-                              json={},
-                              content_type='application/json')
+        response = client.post('/api/tools/ghidra/decompile', json={})
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
 
     def test_ghidra_decompile_binary_not_found(self, client):
         """Test ghidra/decompile returns error for non-existent binary"""
-        response = client.post('/api/tools/ghidra/decompile',
-                              json={'binary': '/nonexistent/binary'},
-                              content_type='application/json')
+        response = client.post('/api/tools/ghidra/decompile', json={'binary': '/nonexistent/binary'})
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert 'not found' in data['error'].lower()
 
     @patch('bear_server.find_ghidra_headless')
@@ -100,15 +127,159 @@ INFO Done''',
             'return_code': 0
         }
 
-        response = client.post('/api/tools/ghidra/decompile',
-                              json={'binary': '/tmp/test', 'function': 'main'},
-                              content_type='application/json')
+        response = client.post('/api/tools/ghidra/decompile', json={'binary': '/tmp/test', 'function': 'main'})
         assert response.status_code == 200
-        data = json.loads(response.data)
+        data = response.json()
         assert data['success'] == True
         assert 'decompiled' in data
         assert len(data['decompiled']['functions']) == 1
         assert data['decompiled']['functions'][0]['name'] == 'main'
+
+    @patch('bear_server.find_ghidra_headless')
+    @patch('bear_server.execute_command')
+    @patch('os.path.exists')
+    @patch('os.makedirs')
+    def test_ghidra_disassemble_success(self, mock_makedirs, mock_exists,
+                                         mock_execute, mock_find_ghidra, client):
+        """Test successful ghidra disassembly"""
+        mock_find_ghidra.return_value = '/opt/ghidra/support/analyzeHeadless'
+        mock_exists.return_value = True
+        mock_execute.return_value = {
+            'success': True,
+            'stdout': '''INFO Analysis complete
+===BEAR_JSON_START===
+{
+  "binary": "/tmp/test",
+  "format": "ELF",
+  "functions": [
+    {
+      "name": "main",
+      "address": "0x401000",
+      "instructions": [
+        {"address": "0x401000", "mnemonic": "PUSH", "operands": "RBP", "bytes": "55"}
+      ]
+    }
+  ]
+}
+===BEAR_JSON_END===
+INFO Done''',
+            'stderr': '',
+            'return_code': 0
+        }
+
+        response = client.post('/api/tools/ghidra/disassemble', json={'binary': '/tmp/test', 'function': 'main'})
+        assert response.status_code == 200
+        data = response.json()
+        assert data['success'] == True
+        assert 'disassembled' in data
+        assert len(data['disassembled']['functions']) == 1
+        assert data['disassembled']['functions'][0]['instructions'][0]['mnemonic'] == 'PUSH'
+
+    @patch('bear_server.find_ghidra_headless')
+    @patch('bear_server.execute_command')
+    @patch('os.path.exists')
+    @patch('os.makedirs')
+    def test_ghidra_functions_success(self, mock_makedirs, mock_exists,
+                                      mock_execute, mock_find_ghidra, client):
+        """Test successful ghidra function listing"""
+        mock_find_ghidra.return_value = '/opt/ghidra/support/analyzeHeadless'
+        mock_exists.return_value = True
+        mock_execute.return_value = {
+            'success': True,
+            'stdout': '''INFO Analysis complete
+===BEAR_JSON_START===
+{
+  "binary": "/tmp/test",
+  "format": "ELF",
+  "functions": [
+    {"name": "main", "address": "0x401000", "namespace": "Global", "signature": "int main()", "size": 42}
+  ]
+}
+===BEAR_JSON_END===
+INFO Done''',
+            'stderr': '',
+            'return_code': 0
+        }
+
+        response = client.post('/api/tools/ghidra/functions', json={'binary': '/tmp/test'})
+        assert response.status_code == 200
+        data = response.json()
+        assert data['success'] is True
+        assert data['mode'] == 'functions'
+        assert data['functions'][0]['name'] == 'main'
+
+    @patch('bear_server.find_ghidra_headless')
+    @patch('bear_server.execute_command')
+    @patch('os.path.exists')
+    @patch('os.makedirs')
+    def test_ghidra_xrefs_success(self, mock_makedirs, mock_exists,
+                                  mock_execute, mock_find_ghidra, client):
+        """Test successful ghidra xrefs"""
+        mock_find_ghidra.return_value = '/opt/ghidra/support/analyzeHeadless'
+        mock_exists.return_value = True
+        mock_execute.return_value = {
+            'success': True,
+            'stdout': '''INFO Analysis complete
+===BEAR_JSON_START===
+{
+  "binary": "/tmp/test",
+  "format": "ELF",
+  "target": "strcpy",
+  "target_type": "symbol",
+  "resolved_addresses": ["0x401030"],
+  "xrefs_to": [
+    {"from_address": "0x401200", "to_address": "0x401030", "from_function": "vuln", "to_function": "", "reference_type": "CALL"}
+  ],
+  "xrefs_from": []
+}
+===BEAR_JSON_END===
+INFO Done''',
+            'stderr': '',
+            'return_code': 0
+        }
+
+        response = client.post('/api/tools/ghidra/xrefs', json={'binary': '/tmp/test', 'target': 'strcpy'})
+        assert response.status_code == 200
+        data = response.json()
+        assert data['success'] is True
+        assert data['mode'] == 'xrefs'
+        assert data['xrefs_to'][0]['from_function'] == 'vuln'
+
+    @patch('bear_server.find_ghidra_headless')
+    @patch('bear_server.execute_command')
+    @patch('os.path.exists')
+    @patch('os.makedirs')
+    def test_ghidra_callgraph_success(self, mock_makedirs, mock_exists,
+                                      mock_execute, mock_find_ghidra, client):
+        """Test successful ghidra callgraph"""
+        mock_find_ghidra.return_value = '/opt/ghidra/support/analyzeHeadless'
+        mock_exists.return_value = True
+        mock_execute.return_value = {
+            'success': True,
+            'stdout': '''INFO Analysis complete
+===BEAR_JSON_START===
+{
+  "binary": "/tmp/test",
+  "format": "ELF",
+  "function": "main",
+  "direction": "out",
+  "depth": 2,
+  "callgraph": {
+    "main": ["parse_args", "vuln"]
+  }
+}
+===BEAR_JSON_END===
+INFO Done''',
+            'stderr': '',
+            'return_code': 0
+        }
+
+        response = client.post('/api/tools/ghidra/callgraph', json={'binary': '/tmp/test', 'function': 'main'})
+        assert response.status_code == 200
+        data = response.json()
+        assert data['success'] is True
+        assert data['mode'] == 'callgraph'
+        assert 'vuln' in data['callgraph']['main']
 
 
 class TestGDBEndpoints:
@@ -116,11 +287,9 @@ class TestGDBEndpoints:
 
     def test_gdb_missing_params(self, client):
         """Test gdb endpoint returns error when no params provided"""
-        response = client.post('/api/tools/gdb',
-                              json={},
-                              content_type='application/json')
+        response = client.post('/api/tools/gdb', json={})
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
 
     @patch('bear_server.execute_command')
@@ -133,9 +302,7 @@ class TestGDBEndpoints:
             'return_code': 0
         }
 
-        response = client.post('/api/tools/gdb',
-                              json={'binary': '/bin/ls'},
-                              content_type='application/json')
+        response = client.post('/api/tools/gdb', json={'binary': '/bin/ls'})
         assert response.status_code == 200
         mock_execute.assert_called_once()
 
@@ -145,11 +312,9 @@ class TestRadare2Endpoints:
 
     def test_radare2_missing_binary(self, client):
         """Test radare2 endpoint returns error when binary is missing"""
-        response = client.post('/api/tools/radare2',
-                              json={},
-                              content_type='application/json')
+        response = client.post('/api/tools/radare2', json={})
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
 
     @patch('bear_server.execute_command')
@@ -167,9 +332,7 @@ class TestRadare2Endpoints:
         mock_open.return_value.__enter__ = MagicMock()
         mock_open.return_value.__exit__ = MagicMock()
 
-        response = client.post('/api/tools/radare2',
-                              json={'binary': '/bin/ls', 'commands': 'aaa; afl'},
-                              content_type='application/json')
+        response = client.post('/api/tools/radare2', json={'binary': '/bin/ls', 'commands': 'aaa; afl'})
         assert response.status_code == 200
 
 
@@ -178,11 +341,9 @@ class TestBinwalkEndpoints:
 
     def test_binwalk_missing_file(self, client):
         """Test binwalk endpoint returns error when file is missing"""
-        response = client.post('/api/tools/binwalk',
-                              json={},
-                              content_type='application/json')
+        response = client.post('/api/tools/binwalk', json={})
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
 
     @patch('bear_server.execute_command')
@@ -195,9 +356,7 @@ class TestBinwalkEndpoints:
             'return_code': 0
         }
 
-        response = client.post('/api/tools/binwalk',
-                              json={'file_path': '/tmp/firmware.bin'},
-                              content_type='application/json')
+        response = client.post('/api/tools/binwalk', json={'file_path': '/tmp/firmware.bin'})
         assert response.status_code == 200
 
 
@@ -206,11 +365,9 @@ class TestChecksecEndpoints:
 
     def test_checksec_missing_binary(self, client):
         """Test checksec endpoint returns error when binary is missing"""
-        response = client.post('/api/tools/checksec',
-                              json={},
-                              content_type='application/json')
+        response = client.post('/api/tools/checksec', json={})
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
 
     @patch('bear_server.execute_command')
@@ -223,9 +380,7 @@ class TestChecksecEndpoints:
             'return_code': 0
         }
 
-        response = client.post('/api/tools/checksec',
-                              json={'binary': '/bin/ls'},
-                              content_type='application/json')
+        response = client.post('/api/tools/checksec', json={'binary': '/bin/ls'})
         assert response.status_code == 200
 
 
@@ -234,11 +389,9 @@ class TestROPgadgetEndpoints:
 
     def test_ropgadget_missing_binary(self, client):
         """Test ropgadget endpoint returns error when binary is missing"""
-        response = client.post('/api/tools/ropgadget',
-                              json={},
-                              content_type='application/json')
+        response = client.post('/api/tools/ropgadget', json={})
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
 
     @patch('bear_server.execute_command')
@@ -251,9 +404,7 @@ class TestROPgadgetEndpoints:
             'return_code': 0
         }
 
-        response = client.post('/api/tools/ropgadget',
-                              json={'binary': '/bin/ls'},
-                              content_type='application/json')
+        response = client.post('/api/tools/ropgadget', json={'binary': '/bin/ls'})
         assert response.status_code == 200
 
 
@@ -262,11 +413,9 @@ class TestStringsEndpoints:
 
     def test_strings_missing_file(self, client):
         """Test strings endpoint returns error when file is missing"""
-        response = client.post('/api/tools/strings',
-                              json={},
-                              content_type='application/json')
+        response = client.post('/api/tools/strings', json={})
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
 
     @patch('bear_server.execute_command')
@@ -279,9 +428,7 @@ class TestStringsEndpoints:
             'return_code': 0
         }
 
-        response = client.post('/api/tools/strings',
-                              json={'file_path': '/bin/ls'},
-                              content_type='application/json')
+        response = client.post('/api/tools/strings', json={'file_path': '/bin/ls'})
         assert response.status_code == 200
 
 
@@ -290,11 +437,9 @@ class TestObjdumpEndpoints:
 
     def test_objdump_missing_binary(self, client):
         """Test objdump endpoint returns error when binary is missing"""
-        response = client.post('/api/tools/objdump',
-                              json={},
-                              content_type='application/json')
+        response = client.post('/api/tools/objdump', json={})
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
 
     @patch('bear_server.execute_command')
@@ -307,9 +452,7 @@ class TestObjdumpEndpoints:
             'return_code': 0
         }
 
-        response = client.post('/api/tools/objdump',
-                              json={'binary': '/bin/ls', 'disassemble': True},
-                              content_type='application/json')
+        response = client.post('/api/tools/objdump', json={'binary': '/bin/ls', 'disassemble': True})
         assert response.status_code == 200
 
 
@@ -318,11 +461,9 @@ class TestOneGadgetEndpoints:
 
     def test_one_gadget_missing_libc(self, client):
         """Test one-gadget endpoint returns error when libc_path is missing"""
-        response = client.post('/api/tools/one-gadget',
-                              json={},
-                              content_type='application/json')
+        response = client.post('/api/tools/one-gadget', json={})
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
 
     @patch('bear_server.execute_command')
@@ -335,9 +476,7 @@ class TestOneGadgetEndpoints:
             'return_code': 0
         }
 
-        response = client.post('/api/tools/one-gadget',
-                              json={'libc_path': '/lib/x86_64-linux-gnu/libc.so.6'},
-                              content_type='application/json')
+        response = client.post('/api/tools/one-gadget', json={'libc_path': '/lib/x86_64-linux-gnu/libc.so.6'})
         assert response.status_code == 200
 
 
@@ -352,7 +491,7 @@ class TestAsyncTasks:
         bear_server.task_results.clear()
         response = client.get('/api/tasks')
         assert response.status_code == 200
-        data = json.loads(response.data)
+        data = response.json()
         assert data['success'] is True
         assert data['total'] == 0
         assert data['tasks'] == []
@@ -362,34 +501,15 @@ class TestAsyncTasks:
         """Test GET /api/tasks/<task_id> returns 404 for unknown task"""
         response = client.get('/api/tasks/nonexistent_task_id')
         assert response.status_code == 404
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
 
     def test_cancel_task_not_found(self, client):
         """Test DELETE /api/tasks/<task_id> returns 404 for unknown task"""
         response = client.delete('/api/tasks/nonexistent_task_id')
         assert response.status_code == 404
-        data = json.loads(response.data)
+        data = response.json()
         assert 'error' in data
-
-    def test_angr_async_submit(self, client):
-        """Test angr with async_mode=True returns task_id immediately"""
-        with patch('bear_server.run_async_task') as mock_async, \
-             patch('os.path.exists', return_value=True), \
-             patch('builtins.open', create=True) as mock_open:
-            mock_open.return_value.__enter__ = MagicMock(return_value=MagicMock())
-            mock_open.return_value.__exit__ = MagicMock(return_value=False)
-            response = client.post('/api/tools/angr',
-                                   json={'binary': '/bin/ls', 'async_mode': True},
-                                   content_type='application/json')
-            assert response.status_code == 200
-            data = json.loads(response.data)
-            assert data['success'] is True
-            assert data['async'] is True
-            assert 'task_id' in data
-            assert data['status'] == 'queued'
-            assert data['task_id'].startswith('angr_')
-            mock_async.assert_called_once()
 
     def test_get_task_queued(self, client):
         """Test GET /api/tasks/<task_id> returns queued status"""
@@ -402,7 +522,7 @@ class TestAsyncTasks:
         }
         response = client.get(f'/api/tasks/{task_id}')
         assert response.status_code == 200
-        data = json.loads(response.data)
+        data = response.json()
         assert data['task_id'] == task_id
         assert data['status'] == 'queued'
         assert 'result' not in data
@@ -415,12 +535,12 @@ class TestAsyncTasks:
         bear_server.task_results[task_id] = {
             'task_id': task_id, 'status': 'completed',
             'submitted_at': 1000.0, 'started_at': 1001.0, 'completed_at': 1060.0,
-            'command': 'python3 /tmp/angr_analysis.py',
+            'command': 'python3 /tmp/ghidra_analysis.py',
             'result': {'success': True, 'stdout': 'done', 'execution_time': 59.0},
         }
         response = client.get(f'/api/tasks/{task_id}')
         assert response.status_code == 200
-        data = json.loads(response.data)
+        data = response.json()
         assert data['status'] == 'completed'
         assert data['result']['success'] is True
         del bear_server.task_results[task_id]
@@ -436,7 +556,7 @@ class TestAsyncTasks:
         }
         response = client.delete(f'/api/tasks/{task_id}')
         assert response.status_code == 400
-        data = json.loads(response.data)
+        data = response.json()
         assert data['success'] is False
         del bear_server.task_results[task_id]
 
@@ -447,11 +567,11 @@ class TestAsyncTasks:
         bear_server.task_results[task_id] = {
             'task_id': task_id, 'status': 'running',
             'submitted_at': 1000.0, 'started_at': 1001.0,
-            'completed_at': None, 'command': 'python3 /tmp/angr.py', 'result': None,
+            'completed_at': None, 'command': 'python3 /tmp/ghidra.py', 'result': None,
         }
         response = client.get('/api/tasks')
         assert response.status_code == 200
-        data = json.loads(response.data)
+        data = response.json()
         assert data['success'] is True
         task_ids = [t['task_id'] for t in data['tasks']]
         assert task_id in task_ids
