@@ -159,7 +159,7 @@ wheels = [
 [[package]]
 name = "bear"
 version = "1.4.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "diskcache" },
     { name = "fastapi" },

@@ -32,7 +32,7 @@ import time
 
 from fastmcp import FastMCP
 
-from bear_ui import ColoredFormatter
+from bear.ui import ColoredFormatter
 
 # Setup logging
 logging.basicConfig(

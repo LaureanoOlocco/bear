@@ -81,6 +81,21 @@ uv run bear-server
 
 ---
 
+## Project Layout
+
+```text
+bear/
+  server.py          # FastAPI backend
+  mcp.py             # FastMCP server wrapper
+  models.py          # Pydantic request models
+  ui.py              # Colors, banner, log formatting
+  ghidra_scripts/    # Ghidra headless Java scripts
+tests/
+  test_bear_server.py
+```
+
+---
+
 ## Supported Tools
 
 | Category | Tools |

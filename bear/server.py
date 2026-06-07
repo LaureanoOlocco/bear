@@ -45,7 +45,7 @@ from fastapi.responses import JSONResponse
 import psutil
 import uvicorn
 
-from bear_models import (
+from bear.models import (
     BinwalkRequest,
     ChecksecRequest,
     FileCreateRequest,
@@ -75,7 +75,7 @@ from bear_models import (
     TriageRequest,
     XxdRequest,
 )
-from bear_ui import ModernVisualEngine
+from bear.ui import ModernVisualEngine
 
 # ============================================================================
 # LOGGING CONFIGURATION
@@ -1689,7 +1689,7 @@ def main():
     logger.info(f"Cache directory: {CACHE_DIR}")
     logger.info(f"Command timeout: {COMMAND_TIMEOUT}s")
 
-    uvicorn.run("bear_server:app", host="0.0.0.0", port=port, reload=debug_mode, log_level="debug" if debug_mode else "info")
+    uvicorn.run("bear.server:app", host="0.0.0.0", port=port, reload=debug_mode, log_level="debug" if debug_mode else "info")
 
 
 if __name__ == "__main__":

@@ -4,16 +4,12 @@ Tests for the BEAR API endpoints with mocked command execution
 """
 
 import pytest
-import os
-import sys
 from unittest.mock import patch, MagicMock
 
 from fastapi.testclient import TestClient
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from bear_server import app
+import bear.server as bear_server
+from bear.server import app
 
 
 @pytest.fixture
@@ -25,7 +21,7 @@ def client():
 @pytest.fixture
 def mock_execute_command():
     """Mock the execute_command function"""
-    with patch('bear_server.execute_command') as mock:
+    with patch('bear.server.execute_command') as mock:
         yield mock
 
 
@@ -50,7 +46,7 @@ class TestHealthEndpoints:
 class TestTriageEndpoints:
     """Tests for binary triage endpoint"""
 
-    @patch('bear_server.execute_command')
+    @patch('bear.server.execute_command')
     @patch('os.path.exists')
     def test_triage_binary_success(self, mock_exists, mock_execute, client):
         """Test successful binary triage"""
@@ -96,8 +92,8 @@ class TestGhidraEndpoints:
         data = response.json()
         assert 'not found' in data['error'].lower()
 
-    @patch('bear_server.find_ghidra_headless')
-    @patch('bear_server.execute_command')
+    @patch('bear.server.find_ghidra_headless')
+    @patch('bear.server.execute_command')
     @patch('os.path.exists')
     @patch('os.makedirs')
     def test_ghidra_decompile_success(self, mock_makedirs, mock_exists,
@@ -135,8 +131,8 @@ INFO Done''',
         assert len(data['decompiled']['functions']) == 1
         assert data['decompiled']['functions'][0]['name'] == 'main'
 
-    @patch('bear_server.find_ghidra_headless')
-    @patch('bear_server.execute_command')
+    @patch('bear.server.find_ghidra_headless')
+    @patch('bear.server.execute_command')
     @patch('os.path.exists')
     @patch('os.makedirs')
     def test_ghidra_disassemble_success(self, mock_makedirs, mock_exists,
@@ -175,8 +171,8 @@ INFO Done''',
         assert len(data['disassembled']['functions']) == 1
         assert data['disassembled']['functions'][0]['instructions'][0]['mnemonic'] == 'PUSH'
 
-    @patch('bear_server.find_ghidra_headless')
-    @patch('bear_server.execute_command')
+    @patch('bear.server.find_ghidra_headless')
+    @patch('bear.server.execute_command')
     @patch('os.path.exists')
     @patch('os.makedirs')
     def test_ghidra_functions_success(self, mock_makedirs, mock_exists,
@@ -208,8 +204,8 @@ INFO Done''',
         assert data['mode'] == 'functions'
         assert data['functions'][0]['name'] == 'main'
 
-    @patch('bear_server.find_ghidra_headless')
-    @patch('bear_server.execute_command')
+    @patch('bear.server.find_ghidra_headless')
+    @patch('bear.server.execute_command')
     @patch('os.path.exists')
     @patch('os.makedirs')
     def test_ghidra_xrefs_success(self, mock_makedirs, mock_exists,
@@ -245,8 +241,8 @@ INFO Done''',
         assert data['mode'] == 'xrefs'
         assert data['xrefs_to'][0]['from_function'] == 'vuln'
 
-    @patch('bear_server.find_ghidra_headless')
-    @patch('bear_server.execute_command')
+    @patch('bear.server.find_ghidra_headless')
+    @patch('bear.server.execute_command')
     @patch('os.path.exists')
     @patch('os.makedirs')
     def test_ghidra_callgraph_success(self, mock_makedirs, mock_exists,
@@ -292,7 +288,7 @@ class TestGDBEndpoints:
         data = response.json()
         assert 'error' in data
 
-    @patch('bear_server.execute_command')
+    @patch('bear.server.execute_command')
     def test_gdb_with_binary(self, mock_execute, client):
         """Test gdb with binary parameter"""
         mock_execute.return_value = {
@@ -317,7 +313,7 @@ class TestRadare2Endpoints:
         data = response.json()
         assert 'error' in data
 
-    @patch('bear_server.execute_command')
+    @patch('bear.server.execute_command')
     @patch('os.path.exists')
     @patch('builtins.open', create=True)
     def test_radare2_with_commands(self, mock_open, mock_exists, mock_execute, client):
@@ -346,7 +342,7 @@ class TestBinwalkEndpoints:
         data = response.json()
         assert 'error' in data
 
-    @patch('bear_server.execute_command')
+    @patch('bear.server.execute_command')
     def test_binwalk_basic(self, mock_execute, client):
         """Test basic binwalk analysis"""
         mock_execute.return_value = {
@@ -370,7 +366,7 @@ class TestChecksecEndpoints:
         data = response.json()
         assert 'error' in data
 
-    @patch('bear_server.execute_command')
+    @patch('bear.server.execute_command')
     def test_checksec_basic(self, mock_execute, client):
         """Test basic checksec"""
         mock_execute.return_value = {
@@ -394,7 +390,7 @@ class TestROPgadgetEndpoints:
         data = response.json()
         assert 'error' in data
 
-    @patch('bear_server.execute_command')
+    @patch('bear.server.execute_command')
     def test_ropgadget_basic(self, mock_execute, client):
         """Test basic ROPgadget search"""
         mock_execute.return_value = {
@@ -418,7 +414,7 @@ class TestStringsEndpoints:
         data = response.json()
         assert 'error' in data
 
-    @patch('bear_server.execute_command')
+    @patch('bear.server.execute_command')
     def test_strings_basic(self, mock_execute, client):
         """Test basic strings extraction"""
         mock_execute.return_value = {
@@ -442,7 +438,7 @@ class TestObjdumpEndpoints:
         data = response.json()
         assert 'error' in data
 
-    @patch('bear_server.execute_command')
+    @patch('bear.server.execute_command')
     def test_objdump_disassemble(self, mock_execute, client):
         """Test objdump disassembly"""
         mock_execute.return_value = {
@@ -466,7 +462,7 @@ class TestOneGadgetEndpoints:
         data = response.json()
         assert 'error' in data
 
-    @patch('bear_server.execute_command')
+    @patch('bear.server.execute_command')
     def test_one_gadget_basic(self, mock_execute, client):
         """Test basic one-gadget search"""
         mock_execute.return_value = {
@@ -486,7 +482,6 @@ class TestAsyncTasks:
 
     def test_list_tasks_empty(self, client):
         """Test /api/tasks returns empty list when no tasks submitted"""
-        import bear_server
         original = dict(bear_server.task_results)
         bear_server.task_results.clear()
         response = client.get('/api/tasks')
@@ -513,7 +508,6 @@ class TestAsyncTasks:
 
     def test_get_task_queued(self, client):
         """Test GET /api/tasks/<task_id> returns queued status"""
-        import bear_server
         task_id = 'test_task_queued_123'
         bear_server.task_results[task_id] = {
             'task_id': task_id, 'status': 'queued',
@@ -530,7 +524,6 @@ class TestAsyncTasks:
 
     def test_get_task_completed(self, client):
         """Test GET /api/tasks/<task_id> returns result when completed"""
-        import bear_server
         task_id = 'test_task_done_456'
         bear_server.task_results[task_id] = {
             'task_id': task_id, 'status': 'completed',
@@ -547,7 +540,6 @@ class TestAsyncTasks:
 
     def test_cancel_completed_task_fails(self, client):
         """Test that cancelling a completed task returns 400"""
-        import bear_server
         task_id = 'test_task_cancel_789'
         bear_server.task_results[task_id] = {
             'task_id': task_id, 'status': 'completed',
@@ -562,7 +554,6 @@ class TestAsyncTasks:
 
     def test_list_tasks_with_entries(self, client):
         """Test /api/tasks lists all submitted tasks"""
-        import bear_server
         task_id = 'test_list_task_abc'
         bear_server.task_results[task_id] = {
             'task_id': task_id, 'status': 'running',

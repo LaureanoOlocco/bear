@@ -16,13 +16,23 @@ dependencies = [
 ]
 
 [project.scripts]
-bear-mcp = "bear_mcp:main"
-bear-server = "bear_server:main"
+bear-mcp = "bear.mcp:main"
+bear-server = "bear.server:main"
 
 [dependency-groups]
 dev = [
     "pytest>=8.0.0,<9.0.0",
 ]
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["bear*"]
+
+[tool.setuptools.package-data]
+bear = ["ghidra_scripts/*.java"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
