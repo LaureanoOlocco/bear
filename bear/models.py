@@ -15,6 +15,8 @@ class BearBaseModel(BaseModel):
 class GenericCommandRequest(BearBaseModel):
     command: str = Field(min_length=1)
     use_cache: bool = True
+    timeout: int = Field(default=300, ge=1, le=86400)
+    async_mode: bool = False
 
 
 class FileCreateRequest(BearBaseModel):
@@ -49,6 +51,8 @@ class PythonExecuteRequest(BearBaseModel):
     script: str = Field(min_length=1)
     env_name: str = "default"
     filename: str = ""
+    timeout: int = Field(default=300, ge=1, le=86400)
+    async_mode: bool = False
 
 
 class ChecksecRequest(BearBaseModel):
@@ -57,9 +61,16 @@ class ChecksecRequest(BearBaseModel):
 
 class StringsRequest(BearBaseModel):
     file_path: str = Field(min_length=1)
-    min_len: int = 4
-    encoding: str = ""
+    min_len: int = Field(default=4, ge=1, le=4096)
+    encoding: Literal["", "s", "S", "b", "l", "B", "L"] = ""
     additional_args: str = ""
+    offset: int = Field(default=0, ge=0)
+    length: int | None = Field(default=None, ge=0)
+    max_scan_bytes: int = Field(default=16 * 1024 * 1024, ge=1, le=16 * 1024 * 1024)
+    max_strings: int = Field(default=1000, ge=1, le=10000)
+    include_resources: bool = False
+    full_scan: bool = False
+    async_mode: bool = False
 
 
 class ObjdumpRequest(BearBaseModel):
@@ -151,6 +162,13 @@ class TriageRequest(BearBaseModel):
     binary: str = Field(min_length=1)
     strings_limit: int = Field(default=40, ge=0, le=1000)
     use_cache: bool = True
+    offset: int = Field(default=0, ge=0)
+    length: int | None = Field(default=None, ge=0)
+    max_scan_bytes: int = Field(default=16 * 1024 * 1024, ge=1, le=16 * 1024 * 1024)
+    include_resources: bool = False
+    full_scan: bool = False
+    compute_hash: bool = False
+    async_mode: bool = False
 
 
 class GhidraRequest(BearBaseModel):

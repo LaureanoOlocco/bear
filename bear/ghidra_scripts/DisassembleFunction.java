@@ -16,6 +16,7 @@ import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Listing;
+import ghidra.util.NumericUtilities;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -72,7 +73,7 @@ public class DisassembleFunction extends GhidraScript {
         println(json.toString());
     }
 
-    private String disassembleFunction(Function func) {
+    private String disassembleFunction(Function func) throws Exception {
         Listing listing = currentProgram.getListing();
         InstructionIterator instructions = listing.getInstructions(func.getBody(), true);
         List<String> rows = new ArrayList<>();
@@ -84,7 +85,7 @@ public class DisassembleFunction extends GhidraScript {
             row.append("\"address\": \"").append(instr.getAddress().toString()).append("\", ");
             row.append("\"mnemonic\": \"").append(escapeJson(instr.getMnemonicString())).append("\", ");
             row.append("\"operands\": \"").append(escapeJson(formatOperands(instr))).append("\", ");
-            row.append("\"bytes\": \"").append(escapeJson(instr.getBytesString())).append("\"");
+            row.append("\"bytes\": \"").append(NumericUtilities.convertBytesToString(instr.getBytes())).append("\"");
             row.append("}");
             rows.add(row.toString());
         }

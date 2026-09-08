@@ -19,6 +19,9 @@ build/
 
 # Runtime cache
 .bear_cache/
+.bear_artifacts/
+.hypothesis/
+.pytest_cache/
 
 # Test binaries
 *.elf

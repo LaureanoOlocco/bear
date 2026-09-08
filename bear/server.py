@@ -35,6 +35,11 @@ import hashlib
 import shutil
 import venv
 import signal
+import asyncio
+import tempfile
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, Any, Optional
 from pathlib import Path
@@ -76,6 +81,9 @@ from bear.models import (
     XxdRequest,
 )
 from bear.ui import ModernVisualEngine
+from bear.artifacts import BoundedJSONResponse, bounded_result, read_artifact
+from bear.analysis import router as analysis_router
+from bear.ghidra import DisassembleRequest
 
 # ============================================================================
 # LOGGING CONFIGURATION
@@ -102,8 +110,23 @@ except PermissionError:
 logger = logging.getLogger(__name__)
 logging.getLogger('uvicorn.access').setLevel(logging.WARNING)
 
-# FastAPI app configuration
-app = FastAPI(title="BEAR", version="1.4.0")
+@asynccontextmanager
+async def lifespan(app):
+    global task_executor
+    yield
+    with task_lock:
+        for info in task_results.values():
+            if info["status"] in ("queued", "running"):
+                info["cancel_requested"] = True
+                info["_cancel_event"].set()
+        executor, task_executor = task_executor, None
+    if executor is not None:
+        await asyncio.to_thread(executor.shutdown, wait=True)
+
+
+app = FastAPI(title="BEAR", version="1.4.0", lifespan=lifespan,
+              default_response_class=BoundedJSONResponse)
+app.include_router(analysis_router)
 
 
 @app.exception_handler(RequestValidationError)
@@ -150,6 +173,12 @@ process_lock = threading.Lock()
 # Async task tracking
 task_results: Dict[str, Any] = {}
 task_lock = threading.Lock()
+task_context = threading.local()
+task_executor = None
+TASK_WORKERS = max(1, int(os.environ.get("BEAR_TASK_WORKERS", 4)))
+MAX_TASKS = max(1, int(os.environ.get("BEAR_MAX_TASKS", 1000)))
+MAX_PENDING_TASKS = max(1, int(os.environ.get("BEAR_MAX_PENDING_TASKS", 100)))
+TASK_TTL = max(1, int(os.environ.get("BEAR_TASK_TTL", 86400)))
 
 
 def cleanup_temp_file(filepath):
@@ -309,7 +338,7 @@ telemetry = TelemetryCollector()
 # ============================================================================
 
 class ProcessManager:
-    """Process manager for command termination and monitoring"""
+    """Process monitoring and control for subprocess sessions owned by BEAR."""
 
     @staticmethod
     def register_process(pid, command, process_obj):
@@ -322,36 +351,58 @@ class ProcessManager:
                 "status": "running",
                 "progress": 0.0,
                 "last_output": "",
-                "bytes_processed": 0
+                "bytes_processed": 0,
+                "task_id": getattr(task_context, "task_id", None),
+                "progress_percent": None,
             }
 
     @staticmethod
     def update_process_progress(pid, progress, last_output="", bytes_processed=0):
         with process_lock:
             if pid in active_processes:
-                active_processes[pid]["progress"] = progress
-                active_processes[pid]["last_output"] = last_output
+                active_processes[pid]["progress"] = progress if progress is not None else 0.0
+                active_processes[pid]["progress_percent"] = progress * 100 if progress is not None else None
+                active_processes[pid]["last_output"] = last_output[-4096:]
                 active_processes[pid]["bytes_processed"] = bytes_processed
                 runtime = time.time() - active_processes[pid]["start_time"]
                 active_processes[pid]["runtime"] = runtime
-                if progress > 0:
+                if progress is not None and progress > 0:
                     active_processes[pid]["eta"] = (runtime / progress) * (1.0 - progress)
+                else:
+                    active_processes[pid].pop("eta", None)
+
+    @staticmethod
+    def _terminate_process_group(process_obj):
+        """Kill inherited descendants even if the session leader already exited."""
+        try:
+            os.killpg(process_obj.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process_obj.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+        # The leader exiting does not imply that its descendants honored TERM.
+        try:
+            os.killpg(process_obj.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process_obj.wait()
 
     @staticmethod
     def terminate_process(pid):
         with process_lock:
-            if pid in active_processes:
-                try:
-                    process_obj = active_processes[pid]["process"]
-                    if process_obj and process_obj.poll() is None:
-                        process_obj.terminate()
-                        time.sleep(1)
-                        if process_obj.poll() is None:
-                            process_obj.kill()
-                        active_processes[pid]["status"] = "terminated"
-                        return True
-                except Exception as e:
-                    logger.error(f"Error terminating process {pid}: {e}")
+            info = active_processes.get(pid)
+        if info is None:
+            return False
+        try:
+            ProcessManager._terminate_process_group(info["process"])
+            with process_lock:
+                if active_processes.get(pid) is info:
+                    info["status"] = "terminated"
+            return True
+        except OSError:
+            logger.exception("Error terminating process pid=%s", pid)
             return False
 
     @staticmethod
@@ -364,12 +415,14 @@ class ProcessManager:
     @staticmethod
     def get_process_status(pid):
         with process_lock:
-            return active_processes.get(pid, None)
+            info = active_processes.get(pid)
+            return {key: value for key, value in info.items() if key != "process"} if info else None
 
     @staticmethod
     def list_active_processes():
         with process_lock:
-            return dict(active_processes)
+            return {pid: {key: value for key, value in info.items() if key != "process"}
+                    for pid, info in active_processes.items()}
 
     @staticmethod
     def pause_process(pid):
@@ -378,7 +431,7 @@ class ProcessManager:
                 try:
                     process_obj = active_processes[pid]["process"]
                     if process_obj and process_obj.poll() is None:
-                        os.kill(pid, signal.SIGSTOP)
+                        os.killpg(pid, signal.SIGSTOP)
                         active_processes[pid]["status"] = "paused"
                         return True
                 except Exception as e:
@@ -392,7 +445,7 @@ class ProcessManager:
                 try:
                     process_obj = active_processes[pid]["process"]
                     if process_obj and process_obj.poll() is None:
-                        os.kill(pid, signal.SIGCONT)
+                        os.killpg(pid, signal.SIGCONT)
                         active_processes[pid]["status"] = "running"
                         return True
                 except Exception as e:
@@ -405,172 +458,291 @@ class ProcessManager:
 # ============================================================================
 
 class EnhancedCommandExecutor:
-    """Enhanced command executor with progress tracking"""
+    """Drain binary pipes to disk, retaining only fixed-size previews in memory."""
 
-    def __init__(self, command: str, timeout: int = COMMAND_TIMEOUT):
+    def __init__(self, command: str | list[str], timeout: int = COMMAND_TIMEOUT,
+                 max_output_bytes: Optional[int] = None):
+        from bear.artifacts import DEFAULT_MAX_OUTPUT_BYTES
+
         self.command = command
         self.timeout = timeout
+        self.max_output_bytes = (int(os.environ.get("BEAR_MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT_BYTES))
+                                 if max_output_bytes is None else max_output_bytes)
+        if type(self.max_output_bytes) is not int or self.max_output_bytes < 0:
+            raise ValueError("max_output_bytes must be a nonnegative integer")
         self.process = None
-        self.stdout_data = ""
-        self.stderr_data = ""
         self.return_code = None
         self.start_time = None
         self.end_time = None
 
-    def _read_stdout(self):
-        try:
-            if self.process is not None and self.process.stdout is not None:
-                for line in iter(self.process.stdout.readline, ''):
-                    if line:
-                        self.stdout_data += line
-        except Exception:
-            pass
-
-    def _read_stderr(self):
-        try:
-            if self.process is not None and self.process.stderr is not None:
-                for line in iter(self.process.stderr.readline, ''):
-                    if line:
-                        self.stderr_data += line
-        except Exception:
-            pass
-
     def execute(self) -> Dict[str, Any]:
-        self.start_time = time.time()
+        import selectors
+        import tempfile
+        from contextlib import ExitStack
+        from bear.artifacts import COPY_CHUNK_BYTES, PREVIEW_BYTES, store_file
 
+        self.start_time = time.monotonic()
+        success = False
+        finished = False
+        output_bytes = 0
+        timed_out = False
+        output_limit_exceeded = False
+        drain_deadline = None
+        output_incomplete = False
         try:
-            self.process = subprocess.Popen(
-                self.command,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1
-            )
+            check_task_cancelled()
+            with ExitStack() as stack:
+                selector = stack.enter_context(selectors.DefaultSelector())
+                streams = {
+                    name: {"file": stack.enter_context(tempfile.NamedTemporaryFile(mode="w+b")),
+                           "preview": bytearray(), "size": 0}
+                    for name in ("stdout", "stderr")
+                }
+                self.process = subprocess.Popen(
+                    self.command,
+                    shell=isinstance(self.command, str),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    bufsize=0,
+                )
+                pid = self.process.pid
+                ProcessManager.register_process(pid, self.command, self.process)
+                for name in streams:
+                    pipe = getattr(self.process, name)
+                    stack.callback(pipe.close)
+                    os.set_blocking(pipe.fileno(), False)
+                    selector.register(pipe, selectors.EVENT_READ, name)
 
-            pid = self.process.pid
-            ProcessManager.register_process(pid, self.command, self.process)
+                next_progress = 0.0
+                while selector.get_map() or self.process.poll() is None:
+                    check_task_cancelled()
+                    now = time.monotonic()
+                    if not timed_out and not output_limit_exceeded and now - self.start_time >= self.timeout:
+                        timed_out = True
+                        ProcessManager._terminate_process_group(self.process)
+                        drain_deadline = time.monotonic() + 0.5
+                    # Detached descendants may retain pipes outside our process
+                    # group. Do not let their missing EOF defeat a timeout/limit.
+                    if drain_deadline is not None and now >= drain_deadline:
+                        output_incomplete = bool(selector.get_map())
+                        break
+                    if now >= next_progress:
+                        previews = {f"{name}_preview": bytes(stream["preview"]).decode("utf-8", "replace")
+                                    for name, stream in streams.items()}
+                        update_task_progress(stage="executing", progress_percent=None,
+                                             output_bytes=output_bytes, **previews)
+                        ProcessManager.update_process_progress(
+                            pid, None, previews["stdout_preview"] or previews["stderr_preview"], output_bytes)
+                        next_progress = now + 0.1
+                    for key, _ in selector.select(timeout=0.1):
+                        check_task_cancelled()
+                        try:
+                            chunk = os.read(key.fd, COPY_CHUNK_BYTES)
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        stream = streams[key.data]
+                        remaining = self.max_output_bytes - output_bytes
+                        captured = chunk[:remaining]
+                        if captured:
+                            stream["file"].write(captured)
+                            stream["size"] += len(captured)
+                            output_bytes += len(captured)
+                            stream["preview"].extend(captured[:max(0, PREVIEW_BYTES - len(stream["preview"]))])
+                        if len(chunk) > remaining and not output_limit_exceeded:
+                            output_limit_exceeded = True
+                            ProcessManager._terminate_process_group(self.process)
+                            drain_deadline = time.monotonic() + 0.5
 
-            stdout_thread = threading.Thread(target=self._read_stdout)
-            stderr_thread = threading.Thread(target=self._read_stderr)
-            stdout_thread.daemon = True
-            stderr_thread.daemon = True
-            stdout_thread.start()
-            stderr_thread.start()
-
-            try:
-                self.return_code = self.process.wait(timeout=self.timeout)
-                self.end_time = time.time()
-                stdout_thread.join(timeout=1)
-                stderr_thread.join(timeout=1)
-
-                execution_time = self.end_time - self.start_time
-                ProcessManager.cleanup_process(pid)
-                success = self.return_code == 0
-                telemetry.record_execution(success, execution_time)
-
-                return {
-                    "success": success,
-                    "stdout": self.stdout_data,
-                    "stderr": self.stderr_data,
+                self.return_code = self.process.wait()
+                check_task_cancelled()
+                result = {
+                    "success": self.return_code == 0 and not timed_out and not output_limit_exceeded,
                     "return_code": self.return_code,
-                    "execution_time": execution_time,
-                    "command": self.command
+                    "timed_out": timed_out,
+                    "output_limit_exceeded": output_limit_exceeded,
+                    "output_incomplete": output_incomplete,
+                    "output_bytes": output_bytes,
+                    "command": self.command,
                 }
-
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.end_time = time.time()
-                execution_time = self.end_time - self.start_time
-                ProcessManager.cleanup_process(pid)
-                telemetry.record_execution(False, execution_time)
-
-                return {
-                    "success": False,
-                    "stdout": self.stdout_data,
-                    "stderr": self.stderr_data + "\nCommand timed out",
-                    "return_code": -1,
-                    "execution_time": execution_time,
-                    "timed_out": True,
-                    "command": self.command
-                }
-
-        except Exception as e:
-            self.end_time = time.time()
-            execution_time = self.end_time - self.start_time if self.start_time else 0
-            telemetry.record_execution(False, execution_time)
+                if output_limit_exceeded:
+                    result["error"] = "output_limit_exceeded"
+                elif timed_out:
+                    result["error"] = "Command timed out"
+                for name, stream in streams.items():
+                    preview = bytes(stream["preview"])
+                    result[name] = preview.decode("utf-8", "replace")
+                    try:
+                        preview.decode("utf-8")
+                        invalid_utf8 = False
+                    except UnicodeDecodeError:
+                        invalid_utf8 = True
+                    truncated = stream["size"] > len(preview) or output_limit_exceeded or output_incomplete
+                    result[f"{name}_truncated"] = truncated
+                    if stream["size"] and (truncated or invalid_utf8):
+                        stream["file"].flush()
+                        result[f"{name}_artifact"] = store_file(stream["file"].name)
+                update_task_progress(stage="executing", progress_percent=None, output_bytes=output_bytes,
+                                     stdout_preview=result["stdout"], stderr_preview=result["stderr"])
+            check_task_cancelled()
+            result["execution_time"] = time.monotonic() - self.start_time
+            success = result["success"]
+            finished = True
+            return result
+        except TaskCancelled:
+            raise
+        except Exception as exc:
             return {
                 "success": False,
                 "stdout": "",
-                "stderr": str(e),
+                "stderr": str(exc)[:4096],
                 "return_code": -1,
-                "execution_time": execution_time,
-                "error": str(e),
-                "command": self.command
+                "execution_time": time.monotonic() - self.start_time,
+                "timed_out": timed_out,
+                "output_limit_exceeded": output_limit_exceeded,
+                "output_bytes": output_bytes,
+                "error": str(exc)[:4096],
+                "command": self.command,
             }
+        finally:
+            try:
+                if self.process is not None and not finished:
+                    ProcessManager._terminate_process_group(self.process)
+            finally:
+                if self.process is not None:
+                    ProcessManager.cleanup_process(self.process.pid)
+                    for name in ("stdout", "stderr"):
+                        pipe = getattr(self.process, name)
+                        if pipe is not None:
+                            pipe.close()
+                self.end_time = time.monotonic()
+                telemetry.record_execution(success, self.end_time - self.start_time)
 
 
-def execute_command(command: str, use_cache: bool = True, timeout: int = COMMAND_TIMEOUT,
-                    cache_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Execute a shell command with caching support"""
-    cache_params = cache_params or {}
+def execute_command(command: str | list[str], use_cache: bool = True, timeout: int = COMMAND_TIMEOUT,
+                    cache_params: Optional[Dict[str, Any]] = None,
+                    max_output_bytes: Optional[int] = None) -> Dict[str, Any]:
+    """Run shell strings or shell-free argv lists, caching only successful captures."""
+    check_task_cancelled()
+    executor = EnhancedCommandExecutor(command, timeout, max_output_bytes=max_output_bytes)
+    # Exclude persisted pre-artifact results and results made with different limits.
+    cache_params = {**(cache_params or {}), "_bounded_output_version": 1,
+                    "_timeout": timeout, "_max_output_bytes": executor.max_output_bytes}
     if use_cache:
         cached_result = cache.get(command, cache_params)
         if cached_result:
+            check_task_cancelled()
+            logger.info("Command cache=hit return_code=%s timed_out=%s execution_time=%s",
+                        cached_result.get("return_code"), cached_result.get("timed_out", False),
+                        cached_result.get("execution_time"))
             return cached_result
 
-    executor = EnhancedCommandExecutor(command, timeout)
     result = executor.execute()
+    check_task_cancelled()
 
     if use_cache and result.get("success", False):
         cache.set(command, cache_params, result)
 
+    logger.info("Command cache=%s return_code=%s timed_out=%s execution_time=%s output_bytes=%s",
+                "miss" if use_cache else "disabled", result.get("return_code"),
+                result.get("timed_out", False), result.get("execution_time"), result.get("output_bytes"))
     return result
 
 
 
-def run_async_task(task_id: str, command: str, timeout: int, cleanup_file: Optional[str] = None) -> None:
-    """Submit a command to run in a background thread and store result in task_results.
+class TaskCancelled(Exception):
+    """Cooperative cancellation, raised only on the thread owning a task."""
 
-    Args:
-        task_id: Unique identifier for this task
-        command: Shell command to execute
-        timeout: Execution timeout in seconds
-        cleanup_file: Optional temp file to remove after execution
-    """
-    def _run():
-        with task_lock:
-            task_results[task_id]["status"] = "running"
-            task_results[task_id]["started_at"] = time.time()
 
-        result = execute_command(command, use_cache=False, timeout=timeout)
+def check_task_cancelled():
+    event = getattr(task_context, "cancel_event", None)
+    if event is not None and event.is_set():
+        raise TaskCancelled()
 
-        if cleanup_file:
-            cleanup_temp_file(cleanup_file)
 
-        status = "completed" if result.get("success") else "failed"
-        with task_lock:
-            task_results[task_id].update({
-                "status": status,
-                "result": result,
-                "completed_at": time.time(),
-            })
-        logger.info(f"[ASYNC] Task {task_id} {status} in {result.get('execution_time', 0):.1f}s")
+def update_task_progress(**fields):
+    task_id = getattr(task_context, "task_id", None)
+    if task_id is None:
+        return
+    check_task_cancelled()
+    # Bound partial results before keeping them in the in-memory task registry.
+    if "partial_results" in fields:
+        partial = bounded_result(fields["partial_results"])
+        if isinstance(partial, dict) and partial.get("truncated"):
+            fields["partial_results"] = []
+            fields["partial_results_artifact"] = partial["artifact"]
+        else:
+            fields["partial_results"] = partial
+    with task_lock:
+        info = task_results[task_id]
+        if info["status"] == "running":
+            info.update(fields, updated_at=time.time())
+
+
+def submit_task(operation, label: str) -> dict:
+    """Bound queue/history size and associate cancellation with a task, not a command."""
+    global task_executor
+    task_id = uuid.uuid4().hex
+    event = threading.Event()
+
+    def run():
+        task_context.task_id = task_id
+        task_context.cancel_event = event
+        status, result = "failed", None
+        try:
+            check_task_cancelled()
+            with task_lock:
+                task_results[task_id].update(status="running", started_at=time.time())
+            result = bounded_result(operation())
+            check_task_cancelled()
+            status = "completed" if result.get("success") else "failed"
+        except TaskCancelled:
+            status = "cancelled"
+        except Exception as exc:
+            logger.exception("Task %s (%s) failed", task_id, label)
+            result = {"success": False, "error": str(exc)[:4096]}
+        finally:
+            with task_lock:
+                # A cancellation racing with completion must not be overwritten.
+                if event.is_set():
+                    status, result = "cancelled", None
+                info = task_results[task_id]
+                info.update(status=status, stage=status, result=result, completed_at=time.time())
+                if status == "completed":
+                    info["progress_percent"] = 100.0
+                info.pop("_cancel_event", None)
+            task_context.__dict__.clear()
+            logger.info("Task task_id=%s operation=%s status=%s", task_id, label, status)
 
     with task_lock:
+        now = time.time()
+        finished = sorted((key for key, info in task_results.items()
+                           if info["status"] in ("completed", "failed", "cancelled")),
+                          key=lambda key: task_results[key]["completed_at"] or 0)
+        for key in finished:
+            if len(task_results) >= MAX_TASKS or now - (task_results[key]["completed_at"] or 0) > TASK_TTL:
+                del task_results[key]
+        active = sum(info["status"] in ("queued", "running") for info in task_results.values())
+        if active >= MAX_PENDING_TASKS or len(task_results) >= MAX_TASKS:
+            raise HTTPException(503, "Task queue is full; wait for existing tasks to finish")
         task_results[task_id] = {
-            "task_id": task_id,
-            "status": "queued",
-            "submitted_at": time.time(),
-            "started_at": None,
-            "completed_at": None,
-            "command": command,
-            "result": None,
+            "task_id": task_id, "status": "queued", "stage": "queued", "command": label,
+            "submitted_at": now, "started_at": None, "completed_at": None,
+            "result": None, "progress_percent": None, "cancel_requested": False,
+            "_cancel_event": event,
         }
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    logger.info(f"[ASYNC] Task {task_id} submitted")
+        if task_executor is None:
+            task_executor = ThreadPoolExecutor(max_workers=TASK_WORKERS, thread_name_prefix="bear-task")
+        try:
+            task_executor.submit(run)
+        except Exception:
+            del task_results[task_id]
+            raise
+    return {"success": True, "async": True, "task_id": task_id, "status": "queued",
+            "message": f"Poll GET /api/tasks/{task_id} for progress and results"}
 
 # ============================================================================
 # FILE OPERATIONS MANAGER
@@ -656,54 +828,39 @@ class PythonEnvironmentManager:
     def __init__(self, base_dir: str = "/tmp/bear_envs"):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(exist_ok=True)
+        self.lock = threading.Lock()
 
     def create_venv(self, env_name: str) -> Path:
+        if not env_name or Path(env_name).name != env_name or env_name in (".", ".."):
+            raise ValueError("env_name must be a single directory name")
         env_path = self.base_dir / env_name
-        if not env_path.exists():
-            venv.create(env_path, with_pip=True)
+        with self.lock:
+            if not (env_path / "pyvenv.cfg").is_file():
+                venv.create(env_path, with_pip=True)
         return env_path
 
     def install_package(self, env_name: str, package: str) -> Dict[str, Any]:
         env_path = self.create_venv(env_name)
         pip_path = env_path / "bin" / "pip"
-        try:
-            result = subprocess.run(
-                [str(pip_path), "install", package],
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
-            return {
-                "success": result.returncode == 0,
-                "stdout": result.stdout,
-                "stderr": result.stderr
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return execute_command([str(pip_path), "install", "--", package], use_cache=False)
 
-    def execute_script(self, env_name: str, script: str, filename: str = "") -> Dict[str, Any]:
+    def execute_script(self, env_name: str, script: str, filename: str = "",
+                       timeout: int = COMMAND_TIMEOUT) -> Dict[str, Any]:
         env_path = self.create_venv(env_name)
         python_path = env_path / "bin" / "python"
-        script_file = self.base_dir / (filename or f"script_{int(time.time())}.py")
-        try:
-            with open(script_file, "w") as f:
-                f.write(script)
-            result = subprocess.run(
-                [str(python_path), str(script_file)],
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
-            os.remove(script_file)
-            return {
-                "success": result.returncode == 0,
-                "stdout": result.stdout,
-                "stderr": result.stderr
-            }
-        except Exception as e:
-            if script_file.exists():
-                os.remove(script_file)
-            return {"success": False, "error": str(e)}
+        if filename and (Path(filename).name != filename or filename in (".", "..")):
+            raise ValueError("filename must be a basename")
+        with tempfile.TemporaryDirectory(prefix="script-", dir=self.base_dir) as directory:
+            script_file = Path(directory) / (filename or "analysis.py")
+            script_file.write_text(script, encoding="utf-8")
+            # Keep previously installed per-environment packages. Add BEAR's
+            # bundled analyzers as a fallback, rather than downloading per job.
+            import sysconfig
+            libraries = list(dict.fromkeys([sysconfig.get_path("purelib"), sysconfig.get_path("platlib")]))
+            bootstrap = (f"import runpy,sys; sys.path.extend({libraries!r}); "
+                         "runpy.run_path(sys.argv[1], run_name='__main__')")
+            return execute_command([str(python_path), "-u", "-c", bootstrap, str(script_file)],
+                                   use_cache=False, timeout=timeout)
 
 
 python_env_manager = PythonEnvironmentManager()
@@ -731,6 +888,8 @@ def find_ghidra_headless():
 
     # Try to find it dynamically
     patterns = [
+        os.path.expanduser("~/Ghidra/*/support/analyzeHeadless"),
+        os.path.expanduser("~/ghidra/*/support/analyzeHeadless"),
         os.path.expanduser("~/Documents/ghidra/*/*/support/analyzeHeadless"),
         os.path.expanduser("~/Documents/ghidra/*/support/analyzeHeadless"),
         os.path.expanduser("~/ghidra*/support/analyzeHeadless"),
@@ -791,8 +950,10 @@ def health_check():
 @app.post("/api/command")
 def generic_command(params: GenericCommandRequest):
     """Execute any command"""
+    if params.async_mode:
+        return submit_task(lambda: execute_command(params.command, params.use_cache, params.timeout), "command")
     try:
-        return execute_command(params.command, params.use_cache)
+        return execute_command(params.command, params.use_cache, params.timeout)
     except Exception as e:
         logger.error(f"[API] /api/command - Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
@@ -961,7 +1122,9 @@ def install_package(params: PythonInstallRequest):
 
 @app.post("/api/python/execute")
 def execute_script(params: PythonExecuteRequest):
-    return python_env_manager.execute_script(params.env_name, params.script, params.filename)
+    if params.async_mode:
+        return submit_task(lambda: execute_script(params.model_copy(update={"async_mode": False})), "python")
+    return python_env_manager.execute_script(params.env_name, params.script, params.filename, params.timeout)
 
 
 # ============================================================================
@@ -1084,62 +1247,24 @@ def radare2(params: Radare2Request):
 
 @app.post("/api/tools/triage")
 def triage_binary(params: TriageRequest):
-    """Run a quick binary triage with common static-analysis commands."""
-    params = params.model_dump()
-    binary = params["binary"]
-    strings_limit = params.get("strings_limit", 40)
-    use_cache = params.get("use_cache", True)
+    """Format-aware triage with opt-in whole-file work."""
+    from bear.analysis import triage
 
-    if not os.path.exists(binary):
-        raise ValueError(f"Binary not found: {binary}")
-
-    commands = {
-        "file": f'file "{binary}"',
-        "sha256": f'sha256sum "{binary}"',
-        "checksec": f'checksec --file="{binary}"',
-        "elf_header": f'readelf -h "{binary}"',
-        "dynamic_symbols": f'readelf -Ws "{binary}"',
-    }
-    if strings_limit > 0:
-        commands["strings"] = f'strings -n 4 "{binary}" | head -n {strings_limit}'
-
-    results = {}
-    for name, command in commands.items():
-        results[name] = execute_command(command, use_cache=use_cache, cache_params=params)
-
-    return {
-        "success": True,
-        "binary": binary,
-        "checks": results,
-        "summary": {
-            "file": results.get("file", {}).get("stdout", "").strip(),
-            "sha256": results.get("sha256", {}).get("stdout", "").split()[0] if results.get("sha256", {}).get("stdout") else "",
-            "checksec_available": results.get("checksec", {}).get("success", False),
-        },
-    }
+    if params.async_mode:
+        return submit_task(lambda: triage_binary(params.model_copy(update={"async_mode": False})), "triage")
+    result = triage(params.model_dump(), execute_command, check_task_cancelled)
+    logger.info("Triage format=%s success=%s partial=%s", result["format"], result["success"], result["partial"])
+    return result
 
 
-def build_ghidra_command(binary: str, function_name: str, script_name: str, project_prefix: str,
+def build_ghidra_command(binary: str, function_name: str, script_name: str,
+                         project_dir: Path, ghidra_headless: str, reuse: bool = False,
                          extra_args: Optional[list[str]] = None) -> str:
-    """Build a Ghidra headless command for a BEAR script."""
-    if not os.path.exists(binary):
-        raise ValueError(f"Binary not found: {binary}")
+    """Build safely quoted argv for an already locked project."""
+    from bear.ghidra import build_command
 
-    ghidra_headless = find_ghidra_headless()
-    if not ghidra_headless:
-        raise ValueError("Ghidra analyzeHeadless not found. Set GHIDRA_HEADLESS environment variable.")
-
-    script_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ghidra_scripts")
-
-    if not os.path.exists(os.path.join(script_dir, script_name)):
-        raise ValueError(f"Ghidra script not found: {script_dir}/{script_name}")
-
-    project_dir = f"/tmp/ghidra_projects/{project_prefix}_{os.path.basename(binary)}_{int(time.time())}"
-    os.makedirs(project_dir, exist_ok=True)
-
-    script_args = [function_name] + list(extra_args or [])
-    formatted_args = " ".join(f'"{arg}"' for arg in script_args)
-    return f'"{ghidra_headless}" "{project_dir}" bear_project -import "{binary}" -scriptPath "{script_dir}" -postScript {script_name} {formatted_args} -deleteProject'
+    return build_command(ghidra_headless, str(Path(binary).resolve()), project_dir,
+                         reuse, script_name, [function_name, *(extra_args or [])])
 
 
 def extract_ghidra_json(stdout: str) -> Dict[str, Any]:
@@ -1150,145 +1275,100 @@ def extract_ghidra_json(stdout: str) -> Dict[str, Any]:
         raise ValueError("Ghidra output did not include BEAR JSON markers")
 
     json_start = stdout.index(start_marker) + len(start_marker)
-    json_end = stdout.index(end_marker)
-    json_str = stdout[json_start:json_end].strip()
-    return json.loads(json_str)
+    json_str = stdout[json_start:].lstrip()
+    payload, json_end = json.JSONDecoder().raw_decode(json_str)
+    if not isinstance(payload, dict) or not json_str[json_end:].lstrip().startswith(end_marker):
+        raise ValueError("Ghidra output did not contain a complete BEAR JSON object")
+    return payload
 
 
-def run_ghidra_inspection(params: Dict[str, Any], mode: str, extra_args: list[str]) -> Dict[str, Any]:
-    """Run the shared Ghidra inspection script and parse its JSON output."""
+def run_ghidra(params: Dict[str, Any], mode: str, script_name: str,
+               script_target: str, extra_args: Optional[list[str]] = None) -> Dict[str, Any]:
+    """Use the same locked, parsed pipeline for synchronous and asynchronous calls."""
+    from bear.ghidra import run_project
+
     binary = params["binary"]
-    analysis_timeout = params.get("timeout", 300)
-    async_mode = params.get("async_mode", False)
+    if not Path(binary).is_file():
+        raise ValueError(f"Binary not found: {binary}")
+    headless = find_ghidra_headless()
+    if not headless:
+        raise ValueError("Ghidra analyzeHeadless not found. Set GHIDRA_HEADLESS environment variable.")
+    if params.get("async_mode", False):
+        return submit_task(
+            lambda: run_ghidra({**params, "async_mode": False}, mode, script_name, script_target, extra_args),
+            label=f"ghidra_{mode}",
+        )
+    analysis_binary = str(Path(binary).resolve())
+    headless = str(Path(headless).resolve())
 
-    command = build_ghidra_command(binary, mode, "InspectBinary.java", mode, extra_args)
-
-    if async_mode:
-        task_id = f"ghidra_{mode}_{int(time.time() * 1000)}"
-        run_async_task(task_id, command, analysis_timeout)
-        return {
-            "success": True,
-            "async": True,
-            "task_id": task_id,
-            "status": "queued",
-            "message": f"Ghidra {mode} inspection submitted. Poll GET /api/tasks/{task_id} for results.",
-        }
-
-    result = execute_command(command, timeout=analysis_timeout, cache_params=params)
-    if result.get("success") and result.get("stdout"):
+    def inspect(project: Path, reuse: bool) -> Dict[str, Any]:
+        command = build_ghidra_command(analysis_binary, script_target, script_name, project,
+                                       headless, reuse, extra_args)
+        result = execute_command(command, use_cache=False, timeout=params.get("timeout", 300))
+        check_task_cancelled()
+        if (not result.get("success") or result.get("timed_out") or result.get("cancelled")
+                or result.get("return_code", 0) != 0):
+            return {"success": False, "error": f"Ghidra {mode} failed or produced no output", "details": result}
+        update_task_progress(stage="parsing")
         try:
-            inspected = extract_ghidra_json(result["stdout"])
-            inspected["success"] = True
-            inspected["mode"] = mode
-            return inspected
-        except (ValueError, json.JSONDecodeError) as e:
-            return {
+            stdout = result.get("stdout", "")
+            if result.get("stdout_artifact"):
+                from bear.artifacts import artifact_path
+
+                stdout = Path(artifact_path(result["stdout_artifact"]["artifact_id"])).read_text(
+                    encoding="utf-8", errors="replace")
+            inspected = extract_ghidra_json(stdout)
+            # Headless may exit zero after a failed import/save. Script JSON is
+            # emitted before saving, so it alone cannot certify a reusable project.
+            completion = stdout.rpartition("===BEAR_JSON_END===")[2]
+            if ("REPORT: Save succeeded" not in completion
+                    or (not reuse and "REPORT: Import succeeded" not in completion)):
+                raise ValueError("Ghidra did not confirm successful project save/import")
+        except (ValueError, OSError, KeyError) as e:
+            failure = {
                 "success": False,
                 "error": f"Failed to parse Ghidra {mode} output: {str(e)}",
                 "raw_output": result.get("stdout", ""),
             }
+            for field in ("stderr", "stdout_artifact", "stderr_artifact"):
+                if result.get(field):
+                    failure[field] = result[field]
+            return failure
+        if mode in ("decompile", "disassemble"):
+            key = "decompiled" if mode == "decompile" else "disassembled"
+            return {"success": True, "binary": binary, "function": script_target, key: inspected}
+        return {**inspected, "success": True, "mode": mode}
 
-    return {
-        "success": False,
-        "error": f"Ghidra {mode} inspection failed or produced no output",
-        "details": result,
-    }
+    result = run_project(analysis_binary, headless, inspect, check_task_cancelled, update_task_progress)
+    if result.get("success"):
+        payload = result.get("decompiled", result.get("disassembled", result))
+        failures = [item for item in payload.get("functions", []) if item.get("error")]
+        if payload.get("error") or failures:
+            # A failed query does not invalidate a successfully saved analysis.
+            result = {**result, "success": False,
+                      "error": payload.get("error") or f"{len(failures)} function(s) failed",
+                      "partial": bool(failures) and len(failures) < len(payload["functions"])}
+    logger.info("Ghidra mode=%s success=%s error=%s", mode, result.get("success"), result.get("error", ""))
+    return result
+
+
+def run_ghidra_inspection(params: Dict[str, Any], mode: str, extra_args: list[str]) -> Dict[str, Any]:
+    """Run the shared Ghidra inspection script and parse its JSON output."""
+    return run_ghidra(params, mode, "InspectBinary.java", mode, extra_args)
 
 
 @app.post("/api/tools/ghidra/decompile")
 def ghidra_decompile(params: GhidraRequest):
-    """Decompile binary using Ghidra headless mode with custom script"""
+    """Decompile using a persistent analyzed Ghidra project."""
     params = params.model_dump()
-    binary = params["binary"]
-    function_name = params.get("function", "all")
-    analysis_timeout = params.get("timeout", 300)
-    async_mode = params.get("async_mode", False)
-
-    command = build_ghidra_command(binary, function_name, "DecompileFunction.java", "decompile")
-
-    if async_mode:
-        task_id = f"ghidra_{int(time.time() * 1000)}"
-        run_async_task(task_id, command, analysis_timeout)
-        return {
-            "success": True,
-            "async": True,
-            "task_id": task_id,
-            "status": "queued",
-            "message": f"Ghidra decompilation submitted. Poll GET /api/tasks/{task_id} for results.",
-        }
-
-    result = execute_command(command, timeout=analysis_timeout, cache_params=params)
-
-    if result.get("success") and result.get("stdout"):
-        stdout = result["stdout"]
-        try:
-            decompiled = extract_ghidra_json(stdout)
-            return {
-                "success": True,
-                "binary": binary,
-                "function": function_name,
-                "decompiled": decompiled
-            }
-        except (ValueError, json.JSONDecodeError) as e:
-            return {
-                "success": False,
-                "error": f"Failed to parse decompilation output: {str(e)}",
-                "raw_output": stdout
-            }
-
-    return {
-        "success": False,
-        "error": "Decompilation failed or produced no output",
-        "details": result
-    }
+    return run_ghidra(params, "decompile", "DecompileFunction.java", params["function"])
 
 
 @app.post("/api/tools/ghidra/disassemble")
 def ghidra_disassemble(params: GhidraRequest):
-    """Disassemble binary using Ghidra headless mode with custom script"""
+    """Disassemble using a persistent analyzed Ghidra project."""
     params = params.model_dump()
-    binary = params["binary"]
-    function_name = params.get("function", "all")
-    analysis_timeout = params.get("timeout", 300)
-    async_mode = params.get("async_mode", False)
-
-    command = build_ghidra_command(binary, function_name, "DisassembleFunction.java", "disassemble")
-
-    if async_mode:
-        task_id = f"ghidra_disassemble_{int(time.time() * 1000)}"
-        run_async_task(task_id, command, analysis_timeout)
-        return {
-            "success": True,
-            "async": True,
-            "task_id": task_id,
-            "status": "queued",
-            "message": f"Ghidra disassembly submitted. Poll GET /api/tasks/{task_id} for results.",
-        }
-
-    result = execute_command(command, timeout=analysis_timeout, cache_params=params)
-
-    if result.get("success") and result.get("stdout"):
-        stdout = result["stdout"]
-        try:
-            disassembled = extract_ghidra_json(stdout)
-            return {
-                "success": True,
-                "binary": binary,
-                "function": function_name,
-                "disassembled": disassembled
-            }
-        except (ValueError, json.JSONDecodeError) as e:
-            return {
-                "success": False,
-                "error": f"Failed to parse disassembly output: {str(e)}",
-                "raw_output": stdout
-            }
-
-    return {
-        "success": False,
-        "error": "Disassembly failed or produced no output",
-        "details": result
-    }
+    return run_ghidra(params, "disassemble", "DisassembleFunction.java", params["function"])
 
 
 @app.post("/api/tools/ghidra/functions")
@@ -1320,6 +1400,25 @@ def ghidra_callgraph(params: GhidraCallgraphRequest):
     )
 
 
+@app.post("/api/tools/disassemble")
+def disassemble_binary(params: DisassembleRequest):
+    """Prefer Ghidra; auto falls back only when Ghidra is unavailable."""
+    import shlex
+
+    if params.async_mode:
+        return submit_task(lambda: disassemble_binary(params.model_copy(update={"async_mode": False})),
+                           label="disassemble")
+    use_ghidra = params.backend == "ghidra" or (params.backend == "auto" and find_ghidra_headless())
+    if use_ghidra:
+        result = ghidra_disassemble(GhidraRequest(**params.model_dump(exclude={"backend"})))
+        return {**result, "backend": "ghidra"}
+    if not Path(params.binary).is_file():
+        raise ValueError(f"Binary not found: {params.binary}")
+    result = execute_command(shlex.join(["objdump", "-M", "intel", "-d", "--", params.binary]),
+                             timeout=params.timeout, cache_params=params.model_dump())
+    return {**result, "backend": "objdump"}
+
+
 @app.post("/api/tools/binwalk")
 def binwalk(params: BinwalkRequest):
     """Execute Binwalk for firmware analysis"""
@@ -1343,24 +1442,29 @@ def binwalk(params: BinwalkRequest):
 
 @app.post("/api/tools/checksec")
 def checksec(params: ChecksecRequest):
-    """Check security features of a binary"""
+    """Use native PE flags, and reserve checksec(1) for ELF."""
+    from bear.analysis import detect_format, pe_metadata, skipped
+    import shlex
+
     params = params.model_dump()
-    command = f"checksec --file={params['binary']}"
+    format_name = detect_format(params["binary"])
+    if format_name == "PE":
+        return pe_metadata(params["binary"])
+    if format_name != "ELF":
+        return {**skipped(f"No native security analyzer for {format_name}"), "format": format_name}
+    command = f"checksec --file={shlex.quote(params['binary'])}"
     return execute_command(command, use_cache=True, cache_params=params)
 
 
 @app.post("/api/tools/strings")
 def strings(params: StringsRequest):
-    """Extract strings from a binary"""
-    params = params.model_dump()
-    min_len = params.get("min_len", 4)
-    command = f"strings -n {min_len}"
-    if params.get("encoding"):
-        command += f" -e {params['encoding']}"
-    if params.get("additional_args"):
-        command += f" {params['additional_args']}"
-    command += f" {params['file_path']}"
-    return execute_command(command, cache_params=params)
+    """Extract bounded native strings; full-file scanning requires opt-in."""
+    from bear.analysis import scan_strings
+
+    options = params.model_dump()
+    if options.pop("async_mode"):
+        return submit_task(lambda: strings(params.model_copy(update={"async_mode": False})), "strings")
+    return scan_strings(options.pop("file_path"), check_cancelled=check_task_cancelled, **options)
 
 
 @app.post("/api/tools/objdump")
@@ -1383,7 +1487,13 @@ def objdump(params: ObjdumpRequest):
 @app.post("/api/tools/readelf")
 def readelf(params: ReadelfRequest):
     """Analyze ELF file headers and structure"""
+    from bear.analysis import detect_format, skipped
+    import shlex
+
     params = params.model_dump()
+    format_name = detect_format(params["binary"])
+    if format_name != "ELF":
+        return {**skipped(f"readelf is ELF-only; detected {format_name}"), "format": format_name}
     command = "readelf"
     if params.get("all_info"):
         command += " -a"
@@ -1396,7 +1506,7 @@ def readelf(params: ReadelfRequest):
             command += " -S"
     if params.get("additional_args"):
         command += f" {params['additional_args']}"
-    command += f" {params['binary']}"
+    command += f" -- {shlex.quote(params['binary'])}"
     return execute_command(command, cache_params=params)
 
 
@@ -1593,11 +1703,12 @@ def pwninit(params: PwninitRequest):
 # ============================================================================
 
 @app.get("/api/tasks")
-def list_tasks():
-    """List all async tasks and their current status"""
+def list_tasks(offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
+    """Page task summaries without duplicating their results."""
     with task_lock:
         tasks = []
-        for task_id, info in task_results.items():
+        entries = list(task_results.items())
+        for task_id, info in entries[offset:offset + limit]:
             entry = {
                 "task_id": task_id,
                 "status": info["status"],
@@ -1605,11 +1716,16 @@ def list_tasks():
                 "started_at": info["started_at"],
                 "completed_at": info["completed_at"],
                 "command": info["command"],
+                "progress_percent": info.get("progress_percent"),
+                "stage": info.get("stage", info["status"]),
+                "cancel_requested": info.get("cancel_requested", False),
             }
             if info["status"] == "running" and info["started_at"]:
                 entry["runtime_seconds"] = round(time.time() - info["started_at"], 1)
             tasks.append(entry)
-    return {"success": True, "total": len(tasks), "tasks": tasks}
+    end = min(len(entries), offset + limit)
+    return {"success": True, "total": len(entries), "tasks": tasks,
+            "offset": offset, "next_offset": end if end < len(entries) else None}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -1617,15 +1733,11 @@ def get_task(task_id):
     """Get the status and result of a specific async task"""
     with task_lock:
         info = task_results.get(task_id)
+        if info is not None:
+            info = {key: value for key, value in info.items() if not key.startswith("_")}
     if info is None:
         return JSONResponse(status_code=404, content={"error": f"Task not found: {task_id}"})
-    response = {
-        "task_id": task_id,
-        "status": info["status"],
-        "submitted_at": info["submitted_at"],
-        "started_at": info["started_at"],
-        "completed_at": info["completed_at"],
-    }
+    response = {key: value for key, value in info.items() if key not in ("result", "command")}
     if info["status"] == "running" and info["started_at"]:
         response["runtime_seconds"] = round(time.time() - info["started_at"], 1)
     if info["status"] in ("completed", "failed") and info["result"] is not None:
@@ -1635,31 +1747,27 @@ def get_task(task_id):
 
 @app.delete("/api/tasks/{task_id}")
 def cancel_task(task_id):
-    """Cancel a queued or running async task"""
+    """Request cancellation; report cancelled only once the worker has cleaned up."""
     with task_lock:
         info = task_results.get(task_id)
-    if info is None:
-        return JSONResponse(status_code=404, content={"error": f"Task not found: {task_id}"})
-    status = info["status"]
-    if status in ("completed", "failed"):
-        return JSONResponse(
-            status_code=400,
-            content={"success": False, "task_id": task_id, "error": f"Task already {status}, cannot cancel"},
-        )
-    cancelled = False
-    with task_lock:
-        processes_snapshot = dict(active_processes)
-    command = info.get("command", "")
-    for pid, proc_info in processes_snapshot.items():
-        if proc_info.get("command") == command:
-            cancelled = ProcessManager.terminate_process(pid)
-            break
-    with task_lock:
-        if task_id in task_results:
-            task_results[task_id]["status"] = "cancelled"
-            task_results[task_id]["completed_at"] = time.time()
-    logger.info(f"[ASYNC] Task {task_id} cancelled (process terminated: {cancelled})")
-    return {"success": True, "task_id": task_id, "status": "cancelled", "process_terminated": cancelled}
+        if info is None:
+            raise HTTPException(404, f"Task not found: {task_id}")
+        status = info["status"]
+        if status in ("completed", "failed", "cancelled"):
+            return JSONResponse(status_code=400, content={
+                "success": False, "task_id": task_id, "error": f"Task already {status}, cannot cancel"})
+        info["cancel_requested"] = True
+        info["_cancel_event"].set()
+    return {"success": True, "task_id": task_id, "status": status, "cancel_requested": True}
+
+
+@app.get("/api/artifacts/{artifact_id}", response_class=JSONResponse)
+def get_artifact(artifact_id: str, offset: int = Query(0, ge=0), limit: int = Query(8192, ge=1, le=8192)):
+    """Read a byte page, encoded losslessly as base64."""
+    try:
+        return read_artifact(artifact_id, offset, limit)
+    except FileNotFoundError:
+        raise HTTPException(404, "Artifact not found") from None
 
 
 # ============================================================================
@@ -1674,6 +1782,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="BEAR - Binary Exploitation & Automated Reversing Server")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument("--host", default=API_HOST, help=f"Bind address (default: {API_HOST})")
     parser.add_argument("--port", type=int, default=API_PORT, help=f"Port (default: {API_PORT})")
     args = parser.parse_args()
 
@@ -1689,7 +1798,7 @@ def main():
     logger.info(f"Cache directory: {CACHE_DIR}")
     logger.info(f"Command timeout: {COMMAND_TIMEOUT}s")
 
-    uvicorn.run("bear.server:app", host="0.0.0.0", port=port, reload=debug_mode, log_level="debug" if debug_mode else "info")
+    uvicorn.run("bear.server:app", host=args.host, port=port, reload=debug_mode, log_level="debug" if debug_mode else "info")
 
 
 if __name__ == "__main__":

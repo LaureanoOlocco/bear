@@ -26,9 +26,11 @@ Framework: FastMCP integration for tool orchestration
 import sys
 import argparse
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Literal, Optional
+from urllib.parse import quote
 import requests
 import time
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError
 
 from fastmcp import FastMCP
 
@@ -56,83 +58,103 @@ VERSION = "1.4.0"
 DEFAULT_BEAR_SERVER = "http://127.0.0.1:8888"
 DEFAULT_REQUEST_TIMEOUT = 300
 MAX_RETRIES = 3
+CONNECT_TIMEOUT = 3
+RETRY_BACKOFF = 0.1
 
 class BearClient:
-    """Client for communicating with the BEAR API Server"""
+    """Lazy API client: backend outages never prevent MCP tool registration."""
 
     def __init__(self, server_url: str, timeout: int = DEFAULT_REQUEST_TIMEOUT):
         self.server_url = server_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
 
-        connected = False
-        for i in range(MAX_RETRIES):
-            try:
-                logger.info(f"Attempting to connect to BEAR API at {server_url} (attempt {i+1}/{MAX_RETRIES})")
-                try:
-                    test_response = self.session.get(f"{self.server_url}/health", timeout=5)
-                    test_response.raise_for_status()
-                    health_check = test_response.json()
-                    connected = True
-                    logger.info(f"Successfully connected to BEAR API Server at {server_url}")
-                    logger.info(f"Server health status: {health_check.get('status', 'unknown')}")
-                    break
-                except requests.exceptions.ConnectionError:
-                    logger.warning(f"Connection refused to {server_url}. Make sure the server is running.")
-                    time.sleep(2)
-                except Exception as e:
-                    logger.warning(f"Connection test failed: {str(e)}")
-                    time.sleep(2)
-            except Exception as e:
-                logger.warning(f"Connection attempt {i+1} failed: {str(e)}")
-                time.sleep(2)
-
-        if not connected:
-            logger.error(f"Failed to connect to BEAR API Server at {server_url} after {MAX_RETRIES} attempts")
-
     def safe_get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if params is None:
-            params = {}
-        url = f"{self.server_url}/{endpoint}"
-        try:
-            response = self.session.get(url, params=params, timeout=self.timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {str(e)}")
-            return {"error": f"Request failed: {str(e)}", "success": False}
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
-            return {"error": f"Unexpected error: {str(e)}", "success": False}
+        return self._request("GET", endpoint, params=params or {})
 
     def safe_post(self, endpoint: str, json_data: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{self.server_url}/{endpoint}"
-        try:
-            response = self.session.post(url, json=json_data, timeout=self.timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {str(e)}")
-            return {"error": f"Request failed: {str(e)}", "success": False}
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
-            return {"error": f"Unexpected error: {str(e)}", "success": False}
+        return self._request("POST", endpoint, json=json_data)
 
     def safe_delete(self, endpoint: str) -> Dict[str, Any]:
-        url = f"{self.server_url}/{endpoint}"
-        try:
-            response = self.session.delete(url, timeout=self.timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed: {str(e)}")
-            return {"error": f"Request failed: {str(e)}", "success": False}
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
-            return {"error": f"Unexpected error: {str(e)}", "success": False}
+        return self._request("DELETE", endpoint)
 
-    def execute_command(self, command: str, use_cache: bool = True) -> Dict[str, Any]:
-        return self.safe_post("api/command", {"command": command, "use_cache": use_cache})
+    def _request(self, method: str, endpoint: str, **kwargs: Any) -> Dict[str, Any]:
+        url = f"{self.server_url}/{endpoint}"
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Disable redirects too: a 307/308 could replay a mutation POST.
+                response = self.session.request(
+                    method, url, timeout=(min(CONNECT_TIMEOUT, self.timeout), self.timeout),
+                    allow_redirects=False, **kwargs,
+                )
+                response.raise_for_status()
+                if 300 <= response.status_code < 400:
+                    raise requests.exceptions.HTTPError("Unexpected backend redirect", response=response)
+                result = response.json()
+                if not isinstance(result, dict):
+                    raise ValueError("Expected a JSON object from the BEAR backend")
+                return result
+            except (requests.exceptions.RequestException, ValueError) as error:
+                # requests wraps urllib3's connection-establishment failures in
+                # MaxRetryError. A generic ConnectionError can instead be a read
+                # reset after command execution and must NOT replay a mutation.
+                cause = error.args[0] if error.args else None
+                not_sent = isinstance(error, requests.exceptions.ConnectTimeout) or (
+                    isinstance(error, requests.exceptions.ConnectionError)
+                    and isinstance(cause, MaxRetryError)
+                    and isinstance(cause.reason, ConnectTimeoutError)
+                )
+                network_error = isinstance(error, (
+                    requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError,
+                ))
+                status_code = (
+                    error.response.status_code
+                    if isinstance(error, requests.exceptions.HTTPError) and error.response is not None
+                    else None
+                )
+                unavailable = network_error or status_code in (502, 503, 504)
+                retryable = not_sent or (method == "GET" and unavailable)
+                if retryable and attempt + 1 < MAX_RETRIES:
+                    if getattr(error, "response", None) is not None:
+                        error.response.close()
+                    time.sleep(RETRY_BACKOFF * 2 ** attempt)
+                    continue
+
+                outcome_unknown = method != "GET" and not not_sent
+                hint = (
+                    "The backend may have executed this operation. It was not replayed after "
+                    "this failure; check task/process status before submitting it again."
+                    if outcome_unknown else
+                    "Check that the BEAR backend is running at server_url, then try again. "
+                    "This MCP process can use it once it is available."
+                )
+                message = f"BEAR backend {'unavailable' if unavailable else 'request failed'}: {error}"
+                logger.error("%s %s: %s", method, url, message)
+                result = {
+                    "success": False,
+                    "error": message,
+                    "error_code": "backend_unavailable" if unavailable else (
+                        "http_error" if status_code is not None else "invalid_response"
+                    ),
+                    "server_url": self.server_url,
+                    "method": method,
+                    "endpoint": endpoint,
+                    "attempts": attempt + 1,
+                    "retryable": retryable,
+                    "outcome_unknown": outcome_unknown,
+                    "hint": hint,
+                }
+                if status_code is not None:
+                    result["status_code"] = status_code
+                return result
+
+    def execute_command(self, command: str, use_cache: bool = True,
+                        async_mode: bool = False, timeout: int = 300) -> Dict[str, Any]:
+        return self.safe_post("api/command", {
+            "command": command, "use_cache": use_cache,
+            "async_mode": async_mode, "timeout": timeout,
+        })
 
     def check_health(self, verbose: bool = False) -> Dict[str, Any]:
         params = {"verbose": "true"} if verbose else None
@@ -264,14 +286,25 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def triage_binary(binary: str, strings_limit: int = 40, use_cache: bool = True) -> Dict[str, Any]:
+    def triage_binary(binary: str, strings_limit: int = 40, use_cache: bool = True,
+                      full_scan: bool = False, compute_hash: bool = False,
+                      offset: int = 0, length: Optional[int] = None,
+                      max_scan_bytes: int = 16777216, include_resources: bool = False,
+                      async_mode: bool = False) -> Dict[str, Any]:
         """
-        Run quick binary triage: file type, SHA256, checksec, ELF headers, symbols, and strings.
+        Run bounded, format-aware binary triage with optional whole-file SHA256.
 
         Args:
             binary: Path to the binary file
             strings_limit: Maximum number of strings to include
             use_cache: Whether to use server-side command cache
+            full_scan: Allow full-file analysis; an explicit strings window still applies
+            compute_hash: Explicitly compute a streamed whole-file SHA256
+            async_mode: Return a task_id immediately, recommended for whole-file work
+            offset: Absolute file-byte offset for the strings window
+            length: Optional byte length of the strings window
+            max_scan_bytes: Maximum bytes to scan by default (16 MiB)
+            include_resources: Include PE resources in the strings scan
 
         Returns:
             Triage summary and command outputs
@@ -280,6 +313,13 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
             "binary": binary,
             "strings_limit": strings_limit,
             "use_cache": use_cache,
+            "full_scan": full_scan,
+            "compute_hash": compute_hash,
+            "async_mode": async_mode,
+            "offset": offset,
+            "length": length,
+            "max_scan_bytes": max_scan_bytes,
+            "include_resources": include_resources,
         }
         logger.info(f"Starting binary triage: {binary}")
         result = bear_client.safe_post("api/tools/triage", data)
@@ -498,15 +538,25 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def strings_extract(file_path: str, min_len: int = 4, encoding: str = "", additional_args: str = "") -> Dict[str, Any]:
+    def strings_extract(file_path: str, min_len: int = 4, encoding: str = "", additional_args: str = "",
+                        offset: int = 0, max_scan_bytes: int = 16777216, full_scan: bool = False,
+                        length: Optional[int] = None, max_strings: int = 1000,
+                        include_resources: bool = False, async_mode: bool = False) -> Dict[str, Any]:
         """
-        Extract printable strings from a binary file.
+        Extract bounded printable strings, skipping PE resources by default.
 
         Args:
             file_path: Path to the file
             min_len: Minimum string length (default: 4)
             encoding: String encoding (s=single-byte, S=single-byte+unicode, b=big-endian, l=little-endian)
-            additional_args: Additional strings arguments
+            additional_args: Must be empty; use explicit bounded scan options instead
+            offset: Byte offset at which to start scanning
+            max_scan_bytes: Maximum bytes to scan by default (16 MiB)
+            full_scan: Remove default size/resource exclusions; an explicit length still applies
+            length: Optional byte length of the absolute file window
+            max_strings: Maximum number of strings to return (1-10000)
+            include_resources: Include PE resource sections in the scan
+            async_mode: Return a task_id immediately, recommended for full_scan
 
         Returns:
             String extraction results
@@ -515,7 +565,14 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
             "file_path": file_path,
             "min_len": min_len,
             "encoding": encoding,
-            "additional_args": additional_args
+            "additional_args": additional_args,
+            "offset": offset,
+            "max_scan_bytes": max_scan_bytes,
+            "full_scan": full_scan,
+            "length": length,
+            "max_strings": max_strings,
+            "include_resources": include_resources,
+            "async_mode": async_mode,
         }
         logger.info(f"Starting Strings extraction: {file_path}")
         result = bear_client.safe_post("api/tools/strings", data)
@@ -530,6 +587,9 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
                        additional_args: str = "") -> Dict[str, Any]:
         """
         Analyze a binary using objdump with Intel syntax.
+
+        Prefer disassemble_binary for normal disassembly (Ghidra by default).
+        Use this tool for explicit objdump options or file metadata.
 
         Args:
             binary: Path to the binary file
@@ -556,15 +616,17 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
 
     @mcp.tool()
     def disassemble_binary(binary: str, function: str = "all", backend: str = "auto",
-                           timeout: int = 300) -> Dict[str, Any]:
+                           timeout: int = 300, async_mode: bool = False) -> Dict[str, Any]:
         """
-        Disassemble a binary, preferring Ghidra and falling back to objdump.
+        Disassemble a binary, preferring Ghidra. Use objdump only when explicitly
+        requested or when Ghidra is unavailable, not after an analysis failure.
 
         Args:
             binary: Path to the binary file
             function: Function name/address for Ghidra; ignored by objdump fallback
             backend: auto, ghidra, or objdump
             timeout: Ghidra analysis timeout in seconds
+            async_mode: Submit as a background task and return task_id immediately
 
         Returns:
             Disassembly result with the backend used
@@ -573,22 +635,10 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
         if selected not in ("auto", "ghidra", "objdump"):
             return {"success": False, "error": "backend must be auto, ghidra, or objdump"}
 
-        if selected in ("auto", "ghidra"):
-            ghidra_result = ghidra_disassemble(binary=binary, function=function, timeout=timeout)
-            if ghidra_result.get("success"):
-                ghidra_result["backend"] = "ghidra"
-                return ghidra_result
-            if selected == "ghidra":
-                ghidra_result["backend"] = "ghidra"
-                return ghidra_result
-            fallback_reason = ghidra_result.get("error", "Ghidra disassembly failed")
-        else:
-            fallback_reason = "backend=objdump requested"
-
-        objdump_result = objdump_analyze(binary=binary, disassemble=True)
-        objdump_result["backend"] = "objdump"
-        objdump_result["fallback_reason"] = fallback_reason
-        return objdump_result
+        return bear_client.safe_post("api/tools/disassemble", {
+            "binary": binary, "function": function, "backend": selected,
+            "timeout": timeout, "async_mode": async_mode,
+        })
 
     @mcp.tool()
     def readelf_analyze(binary: str, headers: bool = True, symbols: bool = False,
@@ -912,6 +962,112 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
     # ============================================================================
 
     @mcp.tool()
+    def pe_resources(binary: Optional[str] = None, resource_type: int | str | None = None,
+                     resource_id: int | str | None = None, language: int | str | None = None,
+                     offset: int = 0, limit: int = 100, artifact_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        List a bounded page of native PE resource metadata, without reading payloads.
+
+        Args:
+            binary: Binary path; provide exactly one of binary or artifact_id
+            resource_type: Optional integer type or exact name; 10 selects RCDATA
+            resource_id: Optional integer ID or exact resource name
+            language: Optional integer language ID or exact name
+            offset: Number of matching resources to skip
+            limit: Maximum metadata entries in this page (1-200)
+            artifact_id: Stored artifact to inspect instead of a binary path
+
+        Returns:
+            Resource metadata and pagination
+        """
+        return bear_client.safe_post("api/tools/pe/resources", {
+            "binary": binary, "artifact_id": artifact_id, "resource_type": resource_type,
+            "resource_id": resource_id, "language": language, "offset": offset, "limit": limit,
+        })
+
+    @mcp.tool()
+    def pe_resources_extract(resource_id: int | str, binary: Optional[str] = None,
+                             resource_type: int | str = 10, language: int | str | None = None,
+                             max_bytes: int = 67108864, artifact_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Extract one native PE resource to an artifact, never an inline payload.
+
+        Args:
+            resource_id: Integer ID or exact resource name to extract
+            binary: Binary path; provide exactly one of binary or artifact_id
+            resource_type: Integer type or exact name; defaults to RCDATA (10)
+            language: Integer language ID or exact name; required if ambiguous
+            max_bytes: Resource size limit in bytes (default 64 MiB, maximum 256 MiB)
+            artifact_id: Stored artifact to inspect instead of a binary path
+
+        Returns:
+            Resource metadata and artifact reference; use read_artifact for pages
+        """
+        return bear_client.safe_post("api/tools/pe/resources/extract", {
+            "binary": binary, "artifact_id": artifact_id, "resource_type": resource_type,
+            "resource_id": resource_id, "language": language, "max_bytes": max_bytes,
+        })
+
+    @mcp.tool()
+    def pe_resources_batch(operation: Literal["sha256", "extract"], binary: Optional[str] = None,
+                           resource_type: int | str | None = None, resource_id: int | str | None = None,
+                           language: int | str | None = None, offset: int = 0, limit: int = 100,
+                           concurrency: int = 2, max_bytes: int = 67108864,
+                           max_total_bytes: int = 268435456, result_offset: int = 0,
+                           result_limit: int = 100, artifact_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Submit a bounded PE resource hash/extraction batch as an async task.
+
+        Args:
+            operation: sha256 or extract
+            binary: Binary path; provide exactly one of binary or artifact_id
+            resource_type: Optional integer type or exact name; 10 selects RCDATA
+            resource_id: Optional integer ID or exact resource name
+            language: Optional integer language ID or exact name
+            offset: Number of matching resources to skip
+            limit: Maximum resources to process (1-500)
+            concurrency: Concurrent workers (1-4)
+            max_bytes: Per-resource size limit (default 64 MiB, maximum 256 MiB)
+            max_total_bytes: Total size limit (default 256 MiB, maximum 1 GiB)
+            result_offset: Number of batch result entries to skip
+            result_limit: Maximum result entries to retain (1-200)
+            artifact_id: Stored artifact to inspect instead of a binary path
+
+        Returns:
+            Async task_id; use get_task_status for progress and paged results.
+            Use smaller batches to obtain all results without repeating operations.
+        """
+        return bear_client.safe_post("api/tools/pe/resources/batch", {
+            "binary": binary, "artifact_id": artifact_id, "operation": operation,
+            "resource_type": resource_type, "resource_id": resource_id, "language": language,
+            "offset": offset, "limit": limit, "concurrency": concurrency,
+            "max_bytes": max_bytes, "max_total_bytes": max_total_bytes,
+            "result_offset": result_offset, "result_limit": result_limit,
+        })
+
+    @mcp.tool()
+    def read_artifact(artifact_id: str, offset: int = 0, limit: int = 8192) -> Dict[str, Any]:
+        """
+        Read one bounded base64 page of a stored large tool output.
+
+        When a result has truncated=true, use artifact.artifact_id here. The
+        preview is not the full result; request further pages as needed.
+
+        Args:
+            artifact_id: Artifact ID returned by the backend, not a file path
+            offset: Byte offset in the stored artifact
+            limit: Maximum bytes to read in this page (1-8192)
+
+        Returns:
+            Base64 page and pagination metadata from the backend
+        """
+        if not artifact_id or artifact_id in (".", "..") or offset < 0 or not 1 <= limit <= 8192:
+            return {"success": False, "error": "Provide an artifact ID, offset >= 0, and limit between 1 and 8192"}
+        return bear_client.safe_get(
+            f"api/artifacts/{quote(artifact_id, safe='')}", {"offset": offset, "limit": limit},
+        )
+
+    @mcp.tool()
     def create_file(filename: str, content: str, binary: bool = False) -> Dict[str, Any]:
         """
         Create a file with specified content.
@@ -1032,7 +1188,8 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def execute_python_script(script: str, env_name: str = "default", filename: str = "") -> Dict[str, Any]:
+    def execute_python_script(script: str, env_name: str = "default", filename: str = "",
+                              async_mode: bool = False, timeout: int = 300) -> Dict[str, Any]:
         """
         Execute a Python script in a virtual environment.
 
@@ -1040,13 +1197,17 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
             script: Python script content to execute
             env_name: Name of the virtual environment
             filename: Custom script filename (auto-generated if empty)
+            async_mode: Submit as a background task and return task_id immediately
+            timeout: Execution timeout in seconds
 
         Returns:
             Script execution results
         """
         data = {
             "script": script,
-            "env_name": env_name
+            "env_name": env_name,
+            "async_mode": async_mode,
+            "timeout": timeout,
         }
         if filename:
             data["filename"] = filename
@@ -1124,27 +1285,31 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def execute_command(command: str, use_cache: bool = True) -> Dict[str, Any]:
+    def execute_command(command: str, use_cache: bool = True,
+                        async_mode: bool = False, timeout: int = 300) -> Dict[str, Any]:
         """
         Execute an arbitrary command on the server.
 
         Args:
             command: The command to execute
             use_cache: Whether to use caching for this command
+            async_mode: Submit as a background task and return task_id immediately
+            timeout: Execution timeout in seconds
 
         Returns:
             Command execution results
         """
         try:
             logger.info(f"Executing command: {command}")
-            result = bear_client.execute_command(command, use_cache)
+            result = bear_client.execute_command(command, use_cache, async_mode, timeout)
             if "error" in result:
                 logger.error(f"Command failed: {result['error']}")
                 return {
+                    **result,
                     "success": False,
                     "error": result["error"],
-                    "stdout": "",
-                    "stderr": f"Error executing command: {result['error']}"
+                    "stdout": result.get("stdout", ""),
+                    "stderr": result.get("stderr", f"Error executing command: {result['error']}")
                 }
 
             if result.get("success"):
@@ -1307,15 +1472,19 @@ def setup_mcp_server(bear_client: BearClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def list_async_tasks() -> Dict[str, Any]:
+    def list_async_tasks(offset: int = 0, limit: int = 50) -> Dict[str, Any]:
         """
-        List all async tasks and their current status.
+        List a page of async tasks and their current status.
+
+        Args:
+            offset: Number of tasks to skip
+            limit: Maximum number of tasks in this page
 
         Returns:
-            All tasks with status, submission time, and runtime info
+            Task page with status, submission time, runtime info, and pagination
         """
         logger.info("Listing async tasks")
-        result = bear_client.safe_get("api/tasks")
+        result = bear_client.safe_get("api/tasks", {"offset": offset, "limit": limit})
         logger.info(f"Found {result.get('total', 0)} async task(s)")
         return result
 
@@ -1361,18 +1530,10 @@ def main():
         logger.debug("Debug logging enabled")
 
     logger.info(f"Starting BEAR MCP Client v{VERSION}")
-    logger.info(f"Connecting to: {args.server}")
+    logger.info(f"Backend configured at: {args.server} (checked only on tool requests)")
 
     try:
         bear_client = BearClient(args.server, args.timeout)
-
-        health = bear_client.check_health()
-        if "error" in health:
-            logger.warning(f"Unable to connect to server at {args.server}: {health['error']}")
-            logger.warning("MCP server will start, but tool execution may fail")
-        else:
-            logger.info(f"Successfully connected to server at {args.server}")
-            logger.info(f"Server health status: {health['status']}")
 
         mcp = setup_mcp_server(bear_client)
         logger.info("Starting BEAR MCP server")
